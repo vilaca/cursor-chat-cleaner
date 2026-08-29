@@ -11,6 +11,23 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import unquote
 
+from cursor_chat_cleaner.schema import (
+    assert_writable_schema as _assert_writable_schema_paths,
+    item_keys as _item_keys,
+    kv_patterns as _kv_patterns,
+    schema_problems as _schema_problems,
+    table_columns as _table_columns,
+    table_exists as _table_exists,
+)
+from cursor_chat_cleaner.transcripts import (
+    backup_transcript_dest as _backup_transcript_dest,
+    directory_size as _dir_size,
+    make_tree_private as _make_tree_private,
+    nested_transcript_files as _nested_transcript_files,
+    transcript_dirs as _transcripts,
+    transcript_dirs_for_ids as _transcript_dirs_for_ids,
+)
+
 
 def default_user_dir() -> Path:
     return Path.home() / "Library/Application Support/Cursor/User"
@@ -103,18 +120,6 @@ class CleanupResult:
     transcript_dirs: int
     transcript_files: int
     vacuumed: bool = False
-
-
-_KV_PREFIXES = (
-    "composerData:{id}",
-    "bubbleId:{id}:",
-    "checkpointId:{id}:",
-    "ofsContent:{id}:",
-    "codeBlockPartialInlineDiffFates:{id}:",
-    "composerVirtualRowHeights:{id}",
-)
-
-_ITEM_KEYS = ("glass/cursor/{id}",)
 
 
 _CURSOR_APP_MARKERS = ("Cursor.app/", "Cursor Nightly.app/")
@@ -250,184 +255,16 @@ def _ids_with_subagents(con: sqlite3.Connection, composer_ids: list[str]) -> lis
     return wanted
 
 
-def _is_safe_path_segment(value: str) -> bool:
-    return bool(
-        value
-        and value not in {".", ".."}
-        and "\x00" not in value
-        and Path(value).name == value
-    )
-
-
-def _transcript_roots(paths: CursorPaths) -> list[Path]:
-    if not paths.projects_dir.is_dir():
-        return []
-    projects_root = paths.projects_dir.resolve()
-    found: list[Path] = []
-    for project_dir in paths.projects_dir.iterdir():
-        if project_dir.is_symlink():
-            continue
-        transcripts_root = project_dir / "agent-transcripts"
-        if transcripts_root.is_symlink() or not transcripts_root.is_dir():
-            continue
-        try:
-            resolved_root = transcripts_root.resolve()
-            resolved_root.relative_to(projects_root)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        found.append(transcripts_root)
-    return sorted(found)
-
-
-def _transcripts(paths: CursorPaths, composer_id: str) -> list[Path]:
-    if not _is_safe_path_segment(composer_id):
-        return []
-    found: list[Path] = []
-    for transcripts_root in _transcript_roots(paths):
-        candidate = transcripts_root / composer_id
-        if candidate.is_symlink():
-            continue
-        try:
-            candidate.resolve().relative_to(transcripts_root.resolve())
-        except (OSError, RuntimeError, ValueError):
-            continue
-        if candidate.is_dir():
-            found.append(candidate)
-    return sorted(found)
-
-
-def _nested_transcript_files(paths: CursorPaths, composer_id: str) -> list[Path]:
-    if not _is_safe_path_segment(composer_id):
-        return []
-    seen: set[Path] = set()
-    found: list[Path] = []
-    for transcripts_root in _transcript_roots(paths):
-        for parent_dir in transcripts_root.iterdir():
-            if parent_dir.is_symlink() or not parent_dir.is_dir():
-                continue
-            subagents_root = parent_dir / "subagents"
-            if subagents_root.is_symlink() or not subagents_root.is_dir():
-                continue
-            candidate = subagents_root / f"{composer_id}.jsonl"
-            if candidate.is_symlink():
-                continue
-            try:
-                resolved = candidate.resolve()
-                resolved.relative_to(subagents_root.resolve())
-                subagents_root.resolve().relative_to(transcripts_root.resolve())
-            except (OSError, RuntimeError, ValueError):
-                continue
-            if candidate.is_file() and resolved not in seen:
-                seen.add(resolved)
-                found.append(candidate)
-    return sorted(found)
-
-
-def _transcript_dirs_for_ids(paths: CursorPaths, composer_ids: list[str]) -> list[Path]:
-    seen: set[Path] = set()
-    found: list[Path] = []
-    for composer_id in composer_ids:
-        for path in _transcripts(paths, composer_id):
-            resolved = path.resolve()
-            if resolved in seen or not path.is_dir():
-                continue
-            seen.add(resolved)
-            found.append(path)
-    return found
-
-
-def _backup_transcript_dest(projects_dir: Path, transcripts_root: Path, path: Path) -> Path:
-    try:
-        return transcripts_root / path.resolve().relative_to(projects_dir.resolve())
-    except ValueError:
-        return transcripts_root / path.parent.parent.name / path.name
-
-
-def _dir_size(path: Path) -> int:
-    total = 0
-    for child in path.rglob("*"):
-        if child.is_file():
-            try:
-                total += child.stat().st_size
-            except OSError:
-                continue
-    return total
-
-
-_REQUIRED_TABLES = {
-    "ItemTable": frozenset({"key", "value"}),
-    "cursorDiskKV": frozenset({"key", "value"}),
-    "composerHeaders": frozenset({"composerId", "isArchived", "isSubagent", "value"}),
-}
-
-
 def _has_composer_headers(con: sqlite3.Connection) -> bool:
-    row = con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='composerHeaders'"
-    ).fetchone()
-    return row is not None
-
-
-def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
-    return {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})")}
+    return _table_exists(con, "composerHeaders")
 
 
 def schema_problems(paths: CursorPaths) -> list[str]:
-    if not paths.global_db.is_file():
-        return [f"Cursor database not found: {paths.global_db}"]
-    problems: list[str] = []
-    con = connect(paths.global_db, readonly=True)
-    try:
-        for table, required in _REQUIRED_TABLES.items():
-            if not _table_exists(con, table):
-                problems.append(f"missing table {table}")
-                continue
-            missing = required - _table_columns(con, table)
-            if missing:
-                problems.append(f"{table} missing columns: {', '.join(sorted(missing))}")
-        if _table_exists(con, "ItemTable"):
-            row = con.execute(
-                "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders.tableGateEnabled'"
-            ).fetchone()
-            if row is None:
-                problems.append(
-                    "composer.composerHeaders.tableGateEnabled is missing"
-                )
-            else:
-                flag = _decode(row["value"]).strip().lower()
-                if flag not in {"true", "1"}:
-                    problems.append(
-                        "composer.composerHeaders.tableGateEnabled is not true"
-                    )
-    finally:
-        con.close()
-    if paths.search_db.is_file():
-        search = connect(paths.search_db, readonly=True)
-        try:
-            if not _table_exists(search, "conversations"):
-                problems.append("conversation-search.db missing table conversations")
-            else:
-                missing = {"id", "is_archived", "fts_rowid"} - _table_columns(
-                    search, "conversations"
-                )
-                if missing:
-                    problems.append(
-                        "conversations missing columns: " + ", ".join(sorted(missing))
-                    )
-            if not _table_exists(search, "conversation_fts"):
-                problems.append("conversation-search.db missing table conversation_fts")
-        finally:
-            search.close()
-    return problems
+    return _schema_problems(paths.global_db, paths.search_db)
 
 
 def assert_writable_schema(paths: CursorPaths) -> None:
-    problems = schema_problems(paths)
-    if problems:
-        raise RuntimeError(
-            "Refusing to change Cursor data; schema is not the expected "
-            "composerHeaders layout:\n  - " + "\n  - ".join(problems)
-        )
+    _assert_writable_schema_paths(paths.global_db, paths.search_db)
 
 
 SORT_KEYS = ("updated", "created", "size", "title", "repo", "workspace")
@@ -602,10 +439,10 @@ def _chat_from_row(
     transcripts: list[Path] = []
     if sizes:
         size_bytes = _kv_size(con, [composer_id, *subs])
-        transcripts = _transcripts(paths, composer_id)
+        transcripts = _transcripts(paths.projects_dir, composer_id)
         all_transcripts = list(transcripts)
         for sub_id in subs:
-            all_transcripts.extend(_transcripts(paths, sub_id))
+            all_transcripts.extend(_transcripts(paths.projects_dir, sub_id))
         size_bytes += sum(_dir_size(path) for path in all_transcripts)
     model = ""
     model_config = body.get("modelConfig")
@@ -650,29 +487,18 @@ def _kv_size(con: sqlite3.Connection, composer_ids: list[str]) -> int:
         for pattern, is_prefix in _kv_patterns(composer_id):
             if is_prefix:
                 row = con.execute(
-                    "SELECT COALESCE(SUM(length(value)), 0) "
+                    "SELECT COALESCE(SUM(length(CAST(value AS BLOB))), 0) "
                     "FROM cursorDiskKV WHERE key LIKE ? ESCAPE '\\'",
                     (pattern,),
                 ).fetchone()
             else:
                 row = con.execute(
-                    "SELECT COALESCE(SUM(length(value)), 0) FROM cursorDiskKV WHERE key = ?",
+                    "SELECT COALESCE(SUM(length(CAST(value AS BLOB))), 0) "
+                    "FROM cursorDiskKV WHERE key = ?",
                     (pattern,),
                 ).fetchone()
             total += int(row[0])
     return total
-
-
-def _kv_patterns(composer_id: str) -> list[tuple[str, bool]]:
-    patterns: list[tuple[str, bool]] = []
-    for template in _KV_PREFIXES:
-        key = template.format(id=composer_id)
-        if key.endswith(":"):
-            escaped = key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            patterns.append((escaped + "%", True))
-        else:
-            patterns.append((key, False))
-    return patterns
 
 
 def _delete_kv(con: sqlite3.Connection, composer_id: str) -> int:
@@ -687,10 +513,6 @@ def _delete_kv(con: sqlite3.Connection, composer_id: str) -> int:
             cur = con.execute("DELETE FROM cursorDiskKV WHERE key = ?", (pattern,))
         deleted += cur.rowcount
     return deleted
-
-
-def _item_keys(composer_id: str) -> list[str]:
-    return [template.format(id=composer_id) for template in _ITEM_KEYS]
 
 
 def _delete_items(con: sqlite3.Connection, composer_id: str) -> int:
@@ -760,13 +582,6 @@ def _delete_search_rows(paths: CursorPaths, composer_ids: list[str]) -> int:
         con.close()
 
 
-def _table_exists(con: sqlite3.Connection, name: str) -> bool:
-    row = con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
-    ).fetchone()
-    return row is not None
-
-
 def default_backup_dir() -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return Path.home() / "cursor-chat-cleaner-backups" / stamp
@@ -774,11 +589,25 @@ def default_backup_dir() -> Path:
 
 def resolve_backup_dir(dest: Path | None) -> Path:
     path = dest.expanduser() if dest is not None else default_backup_dir()
-    if path.exists() and any(path.iterdir()):
-        path = path / datetime.now().strftime("%Y%m%d-%H%M%S")
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.chmod(0o700)
-    return path
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        if not path.is_dir():
+            raise NotADirectoryError(f"Backup destination is not a directory: {path}")
+    else:
+        path.chmod(0o700)
+        return path
+
+    for _attempt in range(100):
+        suffix = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        candidate = path.with_name(f"{path.name}-{suffix}")
+        try:
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        candidate.chmod(0o700)
+        return candidate
+    raise RuntimeError(f"Could not allocate a unique backup directory for {path}")
 
 
 def _write_private_text(path: Path, text: str) -> None:
@@ -787,14 +616,6 @@ def _write_private_text(path: Path, text: str) -> None:
     with os.fdopen(descriptor, "w", encoding="utf-8") as file:
         file.write(text)
     path.chmod(0o600)
-
-
-def _make_tree_private(path: Path) -> None:
-    path.chmod(0o700)
-    for child in path.rglob("*"):
-        if child.is_symlink():
-            continue
-        child.chmod(0o700 if child.is_dir() else 0o600)
 
 
 def backup_chats(paths: CursorPaths, chats: list[Chat], dest: Path | None = None) -> BackupResult:
@@ -883,7 +704,7 @@ def backup_chats(paths: CursorPaths, chats: list[Chat], dest: Path | None = None
 
     transcript_dirs = 0
     transcripts_root = dest_dir / "transcripts"
-    for path in _transcript_dirs_for_ids(paths, unique_ids):
+    for path in _transcript_dirs_for_ids(paths.projects_dir, unique_ids):
         copy_dest = _backup_transcript_dest(paths.projects_dir, transcripts_root, path)
         shutil.copytree(path, copy_dest)
         _make_tree_private(copy_dest)
@@ -1011,7 +832,7 @@ def cleanup_chat_artifacts(
     transcript_files = 0
     seen_files: set[Path] = set()
     for composer_id in unique_ids:
-        for path in _nested_transcript_files(paths, composer_id):
+        for path in _nested_transcript_files(paths.projects_dir, composer_id):
             try:
                 resolved = path.resolve()
             except (OSError, RuntimeError) as exc:
@@ -1027,7 +848,7 @@ def cleanup_chat_artifacts(
                 errors.append(exc)
 
     transcript_dirs = 0
-    for path in _transcript_dirs_for_ids(paths, unique_ids):
+    for path in _transcript_dirs_for_ids(paths.projects_dir, unique_ids):
         try:
             shutil.rmtree(path)
             transcript_dirs += 1
@@ -1426,7 +1247,7 @@ def _messages_from_transcripts(
             for path in sorted(directory.glob("*.jsonl"))
             if path.is_file()
         )
-    files.extend(_nested_transcript_files(paths, chat.composer_id))
+    files.extend(_nested_transcript_files(paths.projects_dir, chat.composer_id))
     unique_files: list[Path] = []
     seen: set[Path] = set()
     for path in files:

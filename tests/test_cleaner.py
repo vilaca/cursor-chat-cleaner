@@ -267,6 +267,16 @@ class CleanerTest(unittest.TestCase):
         self.assertGreater(chats[0].size_bytes, chats[1].size_bytes)
         self.assertEqual(chats[0].composer_id, "arch-1")
 
+    def test_size_counts_utf8_bytes_not_characters(self) -> None:
+        before = list_chats(self.paths, ids=["arch-2"])[0].size_bytes
+        self.con.execute(
+            "INSERT INTO cursorDiskKV VALUES (?,?)",
+            ("ofsContent:arch-2:unicode", "é😀"),
+        )
+        self.con.commit()
+        after = list_chats(self.paths, ids=["arch-2"])[0].size_bytes
+        self.assertEqual(after - before, len("é😀".encode()))
+
     def test_sort_workspace(self) -> None:
         chats = list_chats(self.paths, sort="workspace")
         self.assertEqual([c.workspace_id for c in chats], ["ws1", "empty"])
@@ -394,6 +404,16 @@ class CleanerTest(unittest.TestCase):
                 "SELECT 1 FROM composerHeaders WHERE composerId='live-1'"
             ).fetchone()
         )
+
+    def test_repeated_backups_allocate_unique_directories(self) -> None:
+        dest = Path(self.tmp.name) / "repeated-backup"
+        chats = list_chats(self.paths, ids=["arch-1"])
+        results = [backup_chats(self.paths, chats, dest) for _ in range(3)]
+        paths = [result.path for result in results]
+        self.assertEqual(len(set(paths)), 3)
+        self.assertEqual(paths[0], dest)
+        self.assertTrue(all(path.parent == dest.parent for path in paths))
+        self.assertTrue(all((path / "manifest.json").is_file() for path in paths))
 
     def test_backup_uses_private_permissions(self) -> None:
         result = backup_chats(

@@ -135,6 +135,13 @@ That command does not remove chats from the sidebar. It drops unreferenced `agen
 
 Do not delete `state.vscdb` as a file. That can break Cursor history.
 
+## Architecture
+
+- `cli.py` owns command parsing, confirmation, and output.
+- `store.py` orchestrates chat reads, backups, deletion, cleanup, and statistics.
+- `schema.py` contains the version-sensitive Cursor table and key contract.
+- `transcripts.py` is the containment boundary for transcript discovery, sizing, copying, and deletion.
+
 ## Tests
 
 ```bash
