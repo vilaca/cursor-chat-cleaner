@@ -213,6 +213,28 @@ class CleanerTest(unittest.TestCase):
         chats = list_chats(self.paths, older_than_days=5)
         self.assertEqual([c.composer_id for c in chats], ["arch-1"])
 
+    def test_older_than_uses_created_when_updated_null(self) -> None:
+        self.con.execute(
+            "UPDATE composerHeaders SET lastUpdatedAt = NULL WHERE composerId = 'arch-1'"
+        )
+        self.con.commit()
+        chats = list_chats(self.paths, older_than_days=5)
+        self.assertEqual([c.composer_id for c in chats], ["arch-1"])
+        self.assertGreater(chats[0].updated_at_ms, 0)
+
+    def test_older_than_skips_chats_without_timestamps(self) -> None:
+        self.con.execute(
+            "UPDATE composerHeaders SET createdAt = NULL, lastUpdatedAt = NULL "
+            "WHERE composerId = 'arch-1'"
+        )
+        self.con.execute(
+            "UPDATE cursorDiskKV SET value = ? WHERE key = 'composerData:arch-1'",
+            (json.dumps({"name": "Old archived"}),),
+        )
+        self.con.commit()
+        chats = list_chats(self.paths, older_than_days=5)
+        self.assertEqual([c.composer_id for c in chats], [])
+
     def test_sort_updated_newest_first(self) -> None:
         chats = list_chats(self.paths)
         self.assertEqual([c.composer_id for c in chats], ["arch-2", "arch-1"])
@@ -303,7 +325,16 @@ class CleanerTest(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
         bak.close()
-        self.assertTrue((result.backup_path / "transcripts" / "arch-1" / "arch-1.jsonl").is_file())
+        self.assertTrue(
+            (
+                result.backup_path
+                / "transcripts"
+                / "Users-e1f"
+                / "agent-transcripts"
+                / "arch-1"
+                / "arch-1.jsonl"
+            ).is_file()
+        )
         self.assertIsNone(
             sqlite3.connect(self.paths.global_db)
             .execute("SELECT 1 FROM composerHeaders WHERE composerId='arch-1'")
@@ -355,6 +386,103 @@ class CleanerTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as raised:
             delete_chats(self.paths, [])
         self.assertIn("missing table composerHeaders", str(raised.exception))
+
+    def test_backup_keeps_duplicate_transcript_dirs(self) -> None:
+        other = self.paths.projects_dir / "other-proj" / "agent-transcripts" / "arch-1"
+        other.mkdir(parents=True)
+        (other / "copy.jsonl").write_text("{}\n")
+        result = backup_chats(
+            self.paths, list_chats(self.paths, ids=["arch-1"]), Path(self.tmp.name) / "dup-bak"
+        )
+        self.assertTrue(
+            (
+                result.path
+                / "transcripts"
+                / "Users-e1f"
+                / "agent-transcripts"
+                / "arch-1"
+                / "arch-1.jsonl"
+            ).is_file()
+        )
+        self.assertTrue(
+            (
+                result.path
+                / "transcripts"
+                / "other-proj"
+                / "agent-transcripts"
+                / "arch-1"
+                / "copy.jsonl"
+            ).is_file()
+        )
+
+    def test_delete_includes_subagent_linked_by_parent_id(self) -> None:
+        ts = _now_ms(10)
+        child = "sub-1"
+        header = {
+            "name": "Subagent",
+            "composerId": child,
+            "subagentInfo": {"parentComposerId": "arch-1"},
+        }
+        self.con.execute(
+            "INSERT INTO composerHeaders VALUES (?,?,?,?,?,?,?,?,?)",
+            (child, "ws1", ts, ts, 1, 1, ts, ts, json.dumps(header)),
+        )
+        self.con.execute(
+            "INSERT INTO cursorDiskKV VALUES (?,?)",
+            (
+                f"composerData:{child}",
+                json.dumps(
+                    {
+                        "name": "Subagent",
+                        "subComposerIds": [],
+                        "subagentInfo": {"parentComposerId": "arch-1"},
+                    }
+                ),
+            ),
+        )
+        self.con.execute(
+            "UPDATE cursorDiskKV SET value = ? WHERE key = 'composerData:arch-1'",
+            (json.dumps({"name": "Old archived", "subComposerIds": []}),),
+        )
+        self.con.commit()
+        chats = list_chats(self.paths, ids=["arch-1"])
+        self.assertEqual(chats[0].subcomposer_ids, [child])
+        delete_chats(self.paths, chats)
+        self.assertIsNone(
+            sqlite3.connect(self.paths.global_db)
+            .execute("SELECT 1 FROM composerHeaders WHERE composerId=?", (child,))
+            .fetchone()
+        )
+        self.assertNotIn(f"composerData:{child}", self._kv_keys())
+
+    @patch("cursor_cleaner.store._delete_search_rows", side_effect=sqlite3.Error("fts boom"))
+    def test_delete_removes_transcripts_if_search_fails(self, _mock) -> None:
+        chats = list_chats(self.paths, ids=["arch-1"])
+        transcript = self.paths.projects_dir / "Users-e1f" / "agent-transcripts" / "arch-1"
+        self.assertTrue(transcript.is_dir())
+        with self.assertRaises(RuntimeError) as raised:
+            delete_chats(self.paths, chats)
+        self.assertIn("cleanup did not finish", str(raised.exception))
+        self.assertFalse(transcript.is_dir())
+        self.assertIsNone(
+            sqlite3.connect(self.paths.global_db)
+            .execute("SELECT 1 FROM composerHeaders WHERE composerId='arch-1'")
+            .fetchone()
+        )
+
+    def test_delete_refuses_missing_search_fts(self) -> None:
+        search = sqlite3.connect(self.paths.search_db)
+        search.execute("DROP TABLE conversation_fts")
+        search.commit()
+        search.close()
+        self.assertTrue(any("conversation_fts" in item for item in schema_problems(self.paths)))
+        with self.assertRaises(RuntimeError):
+            delete_chats(self.paths, list_chats(self.paths, ids=["arch-1"]))
+        self.assertIsNotNone(
+            sqlite3.connect(self.paths.global_db)
+            .execute("SELECT 1 FROM composerHeaders WHERE composerId='arch-1'")
+            .fetchone()
+        )
 
     def test_delete_refuses_disabled_header_gate(self) -> None:
         self.con.execute(

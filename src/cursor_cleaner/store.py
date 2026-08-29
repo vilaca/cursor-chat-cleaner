@@ -167,10 +167,94 @@ def _json_object(value: object) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _as_int(*values: object) -> int:
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _parent_composer_id(data: dict) -> str:
+    info = data.get("subagentInfo")
+    if not isinstance(info, dict):
+        return ""
+    for key in ("parentComposerId", "rootParentConversationId"):
+        value = info.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _listed_subcomposer_ids(body: dict) -> list[str]:
+    ids: list[str] = []
+    for key in ("subComposerIds", "subagentComposerIds"):
+        raw = body.get(key) or []
+        if isinstance(raw, list):
+            ids.extend(sid for sid in raw if isinstance(sid, str))
+    return list(dict.fromkeys(ids))
+
+
+def _subagent_ids_by_parent(con: sqlite3.Connection) -> dict[str, list[str]]:
+    mapping: dict[str, list[str]] = {}
+    if not _has_composer_headers(con):
+        return mapping
+    rows = con.execute(
+        "SELECT composerId, value FROM composerHeaders WHERE COALESCE(isSubagent, 0) = 1"
+    ).fetchall()
+    for row in rows:
+        child = row["composerId"]
+        parent = _parent_composer_id(_json_object(row["value"]))
+        if not parent:
+            kv = con.execute(
+                "SELECT value FROM cursorDiskKV WHERE key = ?",
+                (f"composerData:{child}",),
+            ).fetchone()
+            parent = _parent_composer_id(_json_object(kv["value"] if kv else {}))
+        if parent and parent != child:
+            mapping.setdefault(parent, []).append(child)
+    return mapping
+
+
+def _ids_with_subagents(con: sqlite3.Connection, composer_ids: list[str]) -> list[str]:
+    children = _subagent_ids_by_parent(con)
+    wanted = list(dict.fromkeys(composer_ids))
+    seen = set(wanted)
+    for parent in list(wanted):
+        for child in children.get(parent, []):
+            if child not in seen:
+                seen.add(child)
+                wanted.append(child)
+    return wanted
+
+
 def _transcripts(paths: CursorPaths, composer_id: str) -> list[Path]:
     if not paths.projects_dir.is_dir():
         return []
     return sorted(paths.projects_dir.glob(f"*/agent-transcripts/{composer_id}"))
+
+
+def _transcript_dirs_for_ids(paths: CursorPaths, composer_ids: list[str]) -> list[Path]:
+    seen: set[Path] = set()
+    found: list[Path] = []
+    for composer_id in composer_ids:
+        for path in _transcripts(paths, composer_id):
+            resolved = path.resolve()
+            if resolved in seen or not path.is_dir():
+                continue
+            seen.add(resolved)
+            found.append(path)
+    return found
+
+
+def _backup_transcript_dest(projects_dir: Path, transcripts_root: Path, path: Path) -> Path:
+    try:
+        return transcripts_root / path.resolve().relative_to(projects_dir.resolve())
+    except ValueError:
+        return transcripts_root / path.parent.parent.name / path.name
 
 
 def _dir_size(path: Path) -> int:
@@ -233,11 +317,15 @@ def schema_problems(paths: CursorPaths) -> list[str]:
             if not _table_exists(search, "conversations"):
                 problems.append("conversation-search.db missing table conversations")
             else:
-                missing = {"id", "is_archived"} - _table_columns(search, "conversations")
+                missing = {"id", "is_archived", "fts_rowid"} - _table_columns(
+                    search, "conversations"
+                )
                 if missing:
                     problems.append(
                         "conversations missing columns: " + ", ".join(sorted(missing))
                     )
+            if not _table_exists(search, "conversation_fts"):
+                problems.append("conversation-search.db missing table conversation_fts")
         finally:
             search.close()
     return problems
@@ -347,10 +435,19 @@ def list_chats(
         if older_than_days is not None:
             cutoff = datetime.now() - timedelta(days=older_than_days)
             cutoff_ms = int(cutoff.timestamp() * 1000)
+        child_ids = _subagent_ids_by_parent(con)
 
         for row in rows:
-            chat = _chat_from_row(con, paths, row, sizes=sizes)
-            if cutoff_ms is not None and chat.updated_at_ms >= cutoff_ms:
+            chat = _chat_from_row(
+                con,
+                paths,
+                row,
+                sizes=sizes,
+                extra_sub_ids=child_ids.get(row["composerId"], []),
+            )
+            if cutoff_ms is not None and (
+                not chat.updated_at_ms or chat.updated_at_ms >= cutoff_ms
+            ):
                 continue
             if workspace:
                 needle = workspace.lower()
@@ -381,8 +478,8 @@ def _header_from_composer_data(con: sqlite3.Connection, composer_id: str) -> dic
     return {
         "composerId": composer_id,
         "workspaceId": workspace_id,
-        "createdAt": int(body.get("createdAt") or 0),
-        "lastUpdatedAt": int(body.get("lastUpdatedAt") or 0),
+        "createdAt": _as_int(body.get("createdAt")),
+        "lastUpdatedAt": _as_int(body.get("lastUpdatedAt"), body.get("createdAt")),
         "value": json.dumps({"name": body.get("name") or composer_id}),
         "isArchived": 1 if body.get("isArchived") else 0,
         "isSubagent": 1 if body.get("isBestOfNSubcomposer") else 0,
@@ -390,7 +487,12 @@ def _header_from_composer_data(con: sqlite3.Connection, composer_id: str) -> dic
 
 
 def _chat_from_row(
-    con: sqlite3.Connection, paths: CursorPaths, row, *, sizes: bool = True
+    con: sqlite3.Connection,
+    paths: CursorPaths,
+    row,
+    *,
+    sizes: bool = True,
+    extra_sub_ids: list[str] | None = None,
 ) -> Chat:
     composer_id = row["composerId"]
     header = _json_object(row["value"])
@@ -401,11 +503,9 @@ def _chat_from_row(
         (f"composerData:{composer_id}",),
     ).fetchone()
     body = _json_object(composer["value"] if composer else {})
-    subs = [
-        sid
-        for sid in (body.get("subComposerIds") or body.get("subagentComposerIds") or [])
-        if isinstance(sid, str)
-    ]
+    subs = list(
+        dict.fromkeys([*_listed_subcomposer_ids(body), *(extra_sub_ids or [])])
+    )
     size_bytes = 0
     transcripts: list[Path] = []
     if sizes:
@@ -418,21 +518,34 @@ def _chat_from_row(
     model_config = body.get("modelConfig")
     if isinstance(model_config, dict):
         model = str(model_config.get("modelName") or "").strip()
+    created_at_ms = _as_int(
+        row["createdAt"], header.get("createdAt"), body.get("createdAt")
+    )
+    updated_at_ms = _as_int(
+        row["lastUpdatedAt"],
+        header.get("lastUpdatedAt"),
+        body.get("lastUpdatedAt"),
+        created_at_ms,
+    )
     return Chat(
         composer_id=composer_id,
         title=(header.get("name") or body.get("name") or composer_id),
         workspace_id=workspace_id,
         workspace_path=workspace_path,
-        created_at_ms=int(row["createdAt"] or 0),
-        updated_at_ms=int(row["lastUpdatedAt"] or 0),
+        created_at_ms=created_at_ms,
+        updated_at_ms=updated_at_ms,
         size_bytes=size_bytes,
         is_archived=bool(row["isArchived"]),
         is_subagent=bool(row["isSubagent"]),
         model=model,
-        lines_added=int(body.get("totalLinesAdded") or header.get("totalLinesAdded") or 0),
-        lines_removed=int(body.get("totalLinesRemoved") or header.get("totalLinesRemoved") or 0),
-        files_changed=int(body.get("filesChangedCount") or header.get("filesChangedCount") or 0),
-        tokens=int(body.get("contextTokensUsed") or 0),
+        lines_added=_as_int(body.get("totalLinesAdded") or header.get("totalLinesAdded")),
+        lines_removed=_as_int(
+            body.get("totalLinesRemoved") or header.get("totalLinesRemoved")
+        ),
+        files_changed=_as_int(
+            body.get("filesChangedCount") or header.get("filesChangedCount")
+        ),
+        tokens=_as_int(body.get("contextTokensUsed")),
         subcomposer_ids=subs,
         transcript_paths=transcripts,
     )
@@ -504,13 +617,24 @@ def _delete_search_rows(paths: CursorPaths, composer_ids: list[str]) -> int:
         return 0
     con = connect(paths.search_db)
     try:
+        if not _table_exists(con, "conversations"):
+            return 0
+        cols = _table_columns(con, "conversations")
+        if "id" not in cols:
+            return 0
+        has_fts = _table_exists(con, "conversation_fts")
+        has_fts_rowid = "fts_rowid" in cols
+        con.execute("BEGIN")
         deleted = 0
         for composer_id in composer_ids:
-            rows = con.execute(
-                "SELECT fts_rowid FROM conversations WHERE id = ?", (composer_id,)
-            ).fetchall()
-            for row in rows:
-                con.execute("DELETE FROM conversation_fts WHERE rowid = ?", (row[0],))
+            if has_fts and has_fts_rowid:
+                rows = con.execute(
+                    "SELECT fts_rowid FROM conversations WHERE id = ?", (composer_id,)
+                ).fetchall()
+                for row in rows:
+                    con.execute(
+                        "DELETE FROM conversation_fts WHERE rowid = ?", (row[0],)
+                    )
             cur = con.execute("DELETE FROM conversations WHERE id = ?", (composer_id,))
             deleted += cur.rowcount
             if _table_exists(con, "conversation_search_candidates"):
@@ -548,9 +672,10 @@ def backup_chats(paths: CursorPaths, chats: list[Chat], dest: Path | None = None
     if not chats:
         raise ValueError("No chats to back up")
     dest_dir = resolve_backup_dir(dest)
-    unique_ids = list(dict.fromkeys(cid for chat in chats for cid in chat.ids_to_delete))
-
     src = connect(paths.global_db, readonly=True)
+    unique_ids = _ids_with_subagents(
+        src, list(dict.fromkeys(cid for chat in chats for cid in chat.ids_to_delete))
+    )
     dst_path = dest_dir / "chats.sqlite"
     dst = sqlite3.connect(dst_path)
     try:
@@ -618,15 +743,10 @@ def backup_chats(paths: CursorPaths, chats: list[Chat], dest: Path | None = None
 
     transcript_dirs = 0
     transcripts_root = dest_dir / "transcripts"
-    seen: set[Path] = set()
-    for chat in chats:
-        for path in chat.transcript_paths:
-            resolved = path.resolve()
-            if resolved in seen or not path.is_dir():
-                continue
-            shutil.copytree(path, transcripts_root / path.name)
-            seen.add(resolved)
-            transcript_dirs += 1
+    for path in _transcript_dirs_for_ids(paths, unique_ids):
+        copy_dest = _backup_transcript_dest(paths.projects_dir, transcripts_root, path)
+        shutil.copytree(path, copy_dest)
+        transcript_dirs += 1
 
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -665,12 +785,14 @@ def delete_chats(
     if backup_dir is not None:
         backup_path = backup_chats(paths, chats, backup_dir).path
 
-    composer_ids = [cid for chat in chats for cid in chat.ids_to_delete]
-    unique_ids = list(dict.fromkeys(composer_ids))
     bytes_removed = sum(chat.size_bytes for chat in chats)
+    errors: list[BaseException] = []
 
     con = connect(paths.global_db)
     try:
+        unique_ids = _ids_with_subagents(
+            con, list(dict.fromkeys(cid for chat in chats for cid in chat.ids_to_delete))
+        )
         con.execute("BEGIN IMMEDIATE")
         kv_rows = 0
         header_rows = 0
@@ -685,23 +807,39 @@ def delete_chats(
             item_rows += cur.rowcount
         _update_header_cache(con, set(unique_ids))
         con.commit()
-        if vacuum:
-            con.execute("VACUUM")
     finally:
         con.close()
 
-    search_rows = _delete_search_rows(paths, unique_ids)
+    search_rows = 0
+    try:
+        search_rows = _delete_search_rows(paths, unique_ids)
+    except sqlite3.Error as exc:
+        errors.append(exc)
 
     transcript_dirs = 0
-    seen: set[Path] = set()
-    for chat in chats:
-        for path in chat.transcript_paths:
-            resolved = path.resolve()
-            if resolved in seen or not path.is_dir():
-                continue
+    for path in _transcript_dirs_for_ids(paths, unique_ids):
+        try:
             shutil.rmtree(path)
-            seen.add(resolved)
             transcript_dirs += 1
+        except OSError as exc:
+            errors.append(exc)
+
+    vacuumed = False
+    if vacuum:
+        vac = connect(paths.global_db)
+        try:
+            vac.execute("VACUUM")
+            vacuumed = True
+        except sqlite3.Error as exc:
+            errors.append(exc)
+        finally:
+            vac.close()
+
+    if errors:
+        raise RuntimeError(
+            "Deleted chat headers but cleanup did not finish:\n  - "
+            + "\n  - ".join(str(exc) for exc in errors)
+        ) from errors[0]
 
     return DeleteResult(
         chats=len(chats),
@@ -712,7 +850,7 @@ def delete_chats(
         search_rows=search_rows,
         transcript_dirs=transcript_dirs,
         bytes_removed=bytes_removed,
-        vacuumed=vacuum,
+        vacuumed=vacuumed,
         backup_path=backup_path,
     )
 
