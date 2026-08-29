@@ -1,17 +1,41 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "cursor-chat-cleaner"
 version = "0.1.0"
 description = "Find, back up, and delete Cursor chats on macOS"
+authors = [{ name = "João Vilaça" }]
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["chat-history", "cleanup", "backup", "sqlite", "macos"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: Utilities",
+]
 
 [project.scripts]
 cursor-chat-cleaner = "cursor_chat_cleaner.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/vilaca/cursor-chat-cleaner"
+Repository = "https://github.com/vilaca/cursor-chat-cleaner"
+Issues = "https://github.com/vilaca/cursor-chat-cleaner/issues"
+Security = "https://github.com/vilaca/cursor-chat-cleaner/security"
 
 [tool.setuptools.packages.find]
 where = ["src"]
