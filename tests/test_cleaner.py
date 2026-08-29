@@ -10,14 +10,14 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from cursor_cleaner.cli import (
+from cursor_chat_cleaner.cli import (
     GC_BLOBS_HINT,
     active_delete_warning,
     build_parser,
     main,
     selection_archived_only,
 )
-from cursor_cleaner.store import (
+from cursor_chat_cleaner.store import (
     CursorPaths,
     _command_is_cursor_app,
     aggregate_stats,
@@ -487,7 +487,7 @@ class CleanerTest(unittest.TestCase):
         )
         self.assertNotIn(f"composerData:{child}", self._kv_keys())
 
-    @patch("cursor_cleaner.store._delete_search_rows", side_effect=sqlite3.Error("fts boom"))
+    @patch("cursor_chat_cleaner.store._delete_search_rows", side_effect=sqlite3.Error("fts boom"))
     def test_delete_removes_transcripts_if_search_fails(self, _mock) -> None:
         chats = list_chats(self.paths, ids=["arch-1"])
         transcript = self.paths.projects_dir / "Users-e1f" / "agent-transcripts" / "arch-1"
@@ -764,7 +764,7 @@ class CleanerTest(unittest.TestCase):
         )
         self.assertFalse(_command_is_cursor_app("/Applications/Google Chrome.app/"))
 
-    @patch("cursor_cleaner.store.subprocess.run")
+    @patch("cursor_chat_cleaner.store.subprocess.run")
     def test_cursor_is_running_reads_ps_list(self, run) -> None:
         run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -777,7 +777,7 @@ class CleanerTest(unittest.TestCase):
         )
         self.assertTrue(cursor_is_running())
 
-    @patch("cursor_cleaner.store.subprocess.run")
+    @patch("cursor_chat_cleaner.store.subprocess.run")
     def test_cursor_is_running_false_when_only_unrelated(self, run) -> None:
         run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -787,7 +787,7 @@ class CleanerTest(unittest.TestCase):
         )
         self.assertFalse(cursor_is_running())
 
-    @patch("cursor_cleaner.store.subprocess.run")
+    @patch("cursor_chat_cleaner.store.subprocess.run")
     def test_cursor_is_running_fail_closed_if_ps_fails(self, run) -> None:
         run.return_value = subprocess.CompletedProcess(
             args=[], returncode=3, stdout="", stderr="Cannot get process list"

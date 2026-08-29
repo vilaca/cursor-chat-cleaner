@@ -1,4 +1,4 @@
-# cursor-cleaner
+# cursor-chat-cleaner
 
 CLI to list, view, back up, and delete Cursor chats on macOS.
 
@@ -18,7 +18,7 @@ python -m pip install -e .
 Check it:
 
 ```bash
-cursor-cleaner --help
+cursor-chat-cleaner --help
 ```
 
 Later sessions:
@@ -32,7 +32,7 @@ To leave the env: `deactivate`.
 Without installing, you can run:
 
 ```bash
-PYTHONPATH=src python3 -m cursor_cleaner --help
+PYTHONPATH=src python3 -m cursor_chat_cleaner --help
 ```
 
 ## Commands
@@ -40,18 +40,18 @@ PYTHONPATH=src python3 -m cursor_cleaner --help
 `list` shows **archived** chats unless you pass `--all` or `--id`.
 
 ```bash
-cursor-cleaner list
-cursor-cleaner list --all
-cursor-cleaner list --repo e1f --all
-cursor-cleaner list --id <composer-id>
-cursor-cleaner list --sort size
-cursor-cleaner list --sort title --reverse
-cursor-cleaner list --sort repo
-cursor-cleaner list --older-than 30
-cursor-cleaner --user-dir ~/Library/Application\ Support/Cursor\ Nightly/User list
-cursor-cleaner list --repos
-cursor-cleaner list --repos --all
-cursor-cleaner list --json
+cursor-chat-cleaner list
+cursor-chat-cleaner list --all
+cursor-chat-cleaner list --repo e1f --all
+cursor-chat-cleaner list --id <composer-id>
+cursor-chat-cleaner list --sort size
+cursor-chat-cleaner list --sort title --reverse
+cursor-chat-cleaner list --sort repo
+cursor-chat-cleaner list --older-than 30
+cursor-chat-cleaner --user-dir ~/Library/Application\ Support/Cursor\ Nightly/User list
+cursor-chat-cleaner list --repos
+cursor-chat-cleaner list --repos --all
+cursor-chat-cleaner list --json
 ```
 
 `--sort` accepts `updated` (default, newest first), `created`, `size` (largest first), `title`, `repo`, or `workspace`. `--reverse` flips that default.
@@ -59,40 +59,40 @@ cursor-cleaner list --json
 `stats` totals models, line churn, files, and context tokens (all chats unless `--archived`).
 
 ```bash
-cursor-cleaner stats
-cursor-cleaner stats --repo e1f
-cursor-cleaner stats --archived
-cursor-cleaner stats --json
+cursor-chat-cleaner stats
+cursor-chat-cleaner stats --repo e1f
+cursor-chat-cleaner stats --archived
+cursor-chat-cleaner stats --json
 ```
 
 `view` prints one chat (user/assistant text and compact tool lines). Thinking is hidden unless `--thinking`.
 
 ```bash
-cursor-cleaner view <composer-id>
-cursor-cleaner view <composer-id> --thinking
-cursor-cleaner view <composer-id> --json
+cursor-chat-cleaner view <composer-id>
+cursor-chat-cleaner view <composer-id> --thinking
+cursor-chat-cleaner view <composer-id> --json
 ```
 
 `backup` writes a copy and leaves the original in place. It copies **archived** chats only, unless you pass `--id`, `--repo`, or `--all` (`--repo` includes active chats, same as `delete --repo`).
 
 ```bash
-cursor-cleaner backup
-cursor-cleaner backup --id <composer-id> --dest ~/Desktop/chat-backup
-cursor-cleaner backup --repo e1f --dest ~/Desktop/e1f-chats
+cursor-chat-cleaner backup
+cursor-chat-cleaner backup --id <composer-id> --dest ~/Desktop/chat-backup
+cursor-chat-cleaner backup --repo e1f --dest ~/Desktop/e1f-chats
 ```
 
 `delete` removes **archived** chats only, unless you pass `--id` or `--repo` (those include active chats in the match). If the selection includes active chats, delete prints a warning before the dry-run or `--yes` step.
 
 ```bash
-cursor-cleaner delete --dry-run
-cursor-cleaner delete --yes --backup
-cursor-cleaner delete --id <composer-id> --yes --backup ~/Desktop/chat-backup
-cursor-cleaner delete --repo e1f --dry-run
-cursor-cleaner delete --repo e1f --yes --backup
-cursor-cleaner delete --older-than 30 --yes --backup
+cursor-chat-cleaner delete --dry-run
+cursor-chat-cleaner delete --yes --backup
+cursor-chat-cleaner delete --id <composer-id> --yes --backup ~/Desktop/chat-backup
+cursor-chat-cleaner delete --repo e1f --dry-run
+cursor-chat-cleaner delete --repo e1f --yes --backup
+cursor-chat-cleaner delete --older-than 30 --yes --backup
 ```
 
-`--backup` without a path uses `~/cursor-cleaner-backups/<timestamp>`. Each backup has `manifest.json`, `chats.sqlite`, optional `search.json`, and copied transcripts.
+`--backup` without a path uses `~/cursor-chat-cleaner-backups/<timestamp>`. Each backup has `manifest.json`, `chats.sqlite`, optional `search.json`, and copied transcripts.
 
 `--vacuum` runs SQLite `VACUUM` after delete so the database file can shrink. That needs roughly as much free disk as the current DB size.
 

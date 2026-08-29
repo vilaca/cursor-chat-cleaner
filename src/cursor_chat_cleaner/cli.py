@@ -7,8 +7,8 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from cursor_cleaner import __version__
-from cursor_cleaner.store import (
+from cursor_chat_cleaner import __version__
+from cursor_chat_cleaner.store import (
     SORT_KEYS,
     CursorPaths,
     aggregate_stats,
@@ -38,7 +38,7 @@ GC_BLOBS_HINT = (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="cursor-cleaner",
+        prog="cursor-chat-cleaner",
         description="Find, back up, and delete Cursor chats on this Mac.",
         epilog=(
             "Quit Cursor before deleting. After a large cleanup, run "
@@ -100,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     backup_p.add_argument(
         "--dest",
         type=Path,
-        help="Backup directory (default: ~/cursor-cleaner-backups/<timestamp>)",
+        help="Backup directory (default: ~/cursor-chat-cleaner-backups/<timestamp>)",
     )
 
     delete_p = sub.add_parser(
@@ -130,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         const="__default__",
         metavar="DIR",
-        help="Back up selected chats before deleting (default: ~/cursor-cleaner-backups/<timestamp>)",
+        help="Back up selected chats before deleting (default: ~/cursor-chat-cleaner-backups/<timestamp>)",
     )
     delete_p.add_argument(
         "--vacuum",

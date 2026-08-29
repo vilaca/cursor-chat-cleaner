@@ -662,7 +662,7 @@ def _table_exists(con: sqlite3.Connection, name: str) -> bool:
 
 def default_backup_dir() -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return Path.home() / "cursor-cleaner-backups" / stamp
+    return Path.home() / "cursor-chat-cleaner-backups" / stamp
 
 
 def resolve_backup_dir(dest: Path | None) -> Path:
