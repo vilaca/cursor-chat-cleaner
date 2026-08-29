@@ -2,19 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 from cursor_cleaner import __version__
-
-GC_BLOBS_HINT = (
-    "Deleted chats leave orphaned agentKv:blob rows in state.vscdb "
-    "(tool results, diffs, and other payloads keyed by hash, not chat id). "
-    "After Cursor is quit, run Developer: GC Agent KV Blobs from the "
-    "Command Palette (Cmd+Shift+P) to reclaim that space. It does not "
-    "remove chats; it only garbage-collects unreferenced blobs."
-)
 from cursor_cleaner.store import (
     SORT_KEYS,
     CursorPaths,
@@ -31,6 +24,17 @@ from cursor_cleaner.store import (
     summarize_repos,
 )
 
+_CLI_ERRORS = (FileNotFoundError, RuntimeError, ValueError, sqlite3.Error, OSError)
+
+GC_BLOBS_HINT = (
+    "Deleted chats leave orphaned hash-keyed rows in state.vscdb "
+    "(agentKv:blob, composer.content.*, and inlineDiff). This tool cannot "
+    "safely remove them. After Cursor is quit, run Developer: GC Agent KV "
+    "Blobs from the Command Palette (Cmd+Shift+P) to reclaim unreferenced "
+    "agentKv blobs. It does not remove chats. composer.content and "
+    "inlineDiff rows may still remain."
+)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -43,6 +47,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--user-dir",
+        type=Path,
+        help=(
+            "Cursor User directory (default: ~/Library/Application Support/Cursor/User). "
+            "For Nightly: ~/Library/Application Support/Cursor Nightly/User"
+        ),
+    )
+    parser.add_argument(
+        "--projects-dir",
+        type=Path,
+        help="Cursor projects directory (default: ~/.cursor/projects)",
+    )
     sub = parser.add_subparsers(dest="command")
 
     list_p = sub.add_parser("list", help="Show chats (archived only by default)")
@@ -152,9 +169,9 @@ def _add_filters(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--older-than",
-        type=int,
+        type=_positive_days,
         metavar="DAYS",
-        help="Only chats last updated more than DAYS ago",
+        help="Only chats last updated more than DAYS ago (minimum 1)",
     )
     parser.add_argument(
         "--id",
@@ -163,6 +180,25 @@ def _add_filters(parser: argparse.ArgumentParser) -> None:
         metavar="COMPOSER_ID",
         help="This chat id, archived or not (repeatable)",
     )
+
+
+def _positive_days(value: str) -> int:
+    try:
+        days = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("DAYS must be an integer") from exc
+    if days < 1:
+        raise argparse.ArgumentTypeError("DAYS must be at least 1")
+    return days
+
+
+def paths_from_args(args) -> CursorPaths:
+    kwargs: dict[str, Path] = {}
+    if getattr(args, "user_dir", None) is not None:
+        kwargs["user_dir"] = args.user_dir.expanduser()
+    if getattr(args, "projects_dir", None) is not None:
+        kwargs["projects_dir"] = args.projects_dir.expanduser()
+    return CursorPaths(**kwargs)
 
 
 def selection_archived_only(command: str, args) -> bool:
@@ -175,11 +211,21 @@ def selection_archived_only(command: str, args) -> bool:
     return True
 
 
+def active_delete_warning(chats) -> str | None:
+    active = sum(1 for chat in chats if not chat.is_archived)
+    if not active:
+        return None
+    return (
+        f"{active} active chat(s) in this selection will be deleted, "
+        "not only archived."
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     command = args.command or "list"
-    paths = CursorPaths()
+    paths = paths_from_args(args)
     if command == "view":
         return _cmd_view(args, paths)
     ids = getattr(args, "ids", None)
@@ -198,7 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             reverse=getattr(args, "reverse", False),
             sizes=command != "stats" and not getattr(args, "repos", False),
         )
-    except (FileNotFoundError, RuntimeError) as exc:
+    except _CLI_ERRORS as exc:
         print(exc, file=sys.stderr)
         return 2
 
@@ -248,9 +294,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "backup":
         dest = args.dest if args.dest is not None else default_backup_dir()
-        result = backup_chats(paths, chats, dest)
+        try:
+            result = backup_chats(paths, chats, dest)
+        except _CLI_ERRORS as exc:
+            print(exc, file=sys.stderr)
+            return 2
         print(f"Backed up {result.chats} chat(s) to {result.path}")
         return 0
+
+    warning = active_delete_warning(chats)
+    if warning:
+        print(warning)
 
     if args.dry_run or not args.yes:
         print("Dry run. Re-run with --yes to delete. Quit Cursor first.")
@@ -271,7 +325,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         result = delete_chats(paths, chats, vacuum=args.vacuum, backup_dir=backup_dir)
-    except RuntimeError as exc:
+    except _CLI_ERRORS as exc:
         print(exc, file=sys.stderr)
         return 2
     print(
@@ -291,7 +345,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _cmd_view(args, paths: CursorPaths) -> int:
     try:
         chat, messages = load_conversation(paths, args.composer_id)
-    except (FileNotFoundError, RuntimeError) as exc:
+    except _CLI_ERRORS as exc:
         print(exc, file=sys.stderr)
         return 2
     if args.json:

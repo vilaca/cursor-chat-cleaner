@@ -145,6 +145,9 @@ def _workspace_path(paths: CursorPaths, workspace_id: str) -> str:
     except (OSError, json.JSONDecodeError):
         return workspace_id
     folder = data.get("folder") or ""
+    if not folder:
+        workspace = data.get("workspace") or ""
+        folder = workspace if isinstance(workspace, str) else ""
     if folder.startswith("file://"):
         return unquote(folder[len("file://") :])
     return folder or workspace_id
@@ -433,6 +436,8 @@ def list_chats(
         chats: list[Chat] = []
         cutoff_ms = None
         if older_than_days is not None:
+            if older_than_days < 1:
+                raise ValueError("--older-than must be at least 1 day")
             cutoff = datetime.now() - timedelta(days=older_than_days)
             cutoff_ms = int(cutoff.timestamp() * 1000)
         child_ids = _subagent_ids_by_parent(con)
@@ -889,10 +894,27 @@ class ChatStats:
     repos: dict[str, dict[str, int]]
 
 
+def repo_label(chat: Chat, chats: list[Chat]) -> str:
+    name = chat.repo
+    distinct = {
+        (other.workspace_path or other.workspace_id)
+        for other in chats
+        if other.repo.casefold() == name.casefold()
+    }
+    if len(distinct) <= 1:
+        return name
+    path = (chat.workspace_path or chat.workspace_id).rstrip("/")
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 2:
+        return f"{parts[-2]}/{parts[-1]}"
+    return name or chat.workspace_id or "-"
+
+
 def summarize_repos(chats: list[Chat]) -> list[dict[str, int | str]]:
     repos: dict[str, dict[str, int | str]] = {}
     for chat in chats:
-        row = repos.setdefault(chat.repo, {"repo": chat.repo, "chats": 0, "archived": 0})
+        label = repo_label(chat, chats)
+        row = repos.setdefault(label, {"repo": label, "chats": 0, "archived": 0})
         row["chats"] = int(row["chats"]) + 1
         row["archived"] = int(row["archived"]) + int(chat.is_archived)
     return sorted(repos.values(), key=lambda row: (-int(row["chats"]), str(row["repo"]).casefold()))
@@ -905,8 +927,9 @@ def aggregate_stats(chats: list[Chat]) -> ChatStats:
         model = models.setdefault(chat.model or "unknown", {"chats": 0, "tokens": 0})
         model["chats"] += 1
         model["tokens"] += chat.tokens
+        label = repo_label(chat, chats)
         repo = repos.setdefault(
-            chat.repo,
+            label,
             {
                 "chats": 0,
                 "archived": 0,
@@ -1006,7 +1029,20 @@ def load_conversation(paths: CursorPaths, composer_id: str) -> tuple[Chat, list[
     if not chats:
         raise FileNotFoundError(f"Chat not found: {composer_id}")
     chat = chats[0]
-    messages = _messages_from_bubbles(paths, chat) or _messages_from_transcripts(chat)
+    messages = _messages_for_chat(paths, chat)
+    for sub_id in chat.subcomposer_ids:
+        try:
+            subs = list_chats(paths, ids=[sub_id], archived_only=False)
+        except (FileNotFoundError, RuntimeError):
+            continue
+        if not subs:
+            continue
+        sub = subs[0]
+        sub_messages = _messages_for_chat(paths, sub)
+        if not sub_messages:
+            continue
+        messages.append(ChatMessage(role="subagent", text=sub.title or sub_id))
+        messages.extend(sub_messages)
     return chat, messages
 
 
@@ -1025,6 +1061,10 @@ def format_conversation(
     for message in messages:
         if message.role == "thinking" and not thinking:
             continue
+        if message.role == "subagent":
+            lines.append(f"SUBAGENT  {message.text or 'subagent'}")
+            lines.append("")
+            continue
         if message.role == "tool":
             label = f"TOOL  {message.tool_name or 'tool'}"
         else:
@@ -1034,6 +1074,22 @@ def format_conversation(
             lines.append(message.text.rstrip())
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _messages_for_chat(paths: CursorPaths, chat: Chat) -> list[ChatMessage]:
+    bubbles = _messages_from_bubbles(paths, chat)
+    transcripts = _messages_from_transcripts(chat)
+    if not bubbles:
+        return transcripts
+    if not transcripts:
+        return bubbles
+    seen = {message.text.strip() for message in bubbles if message.text.strip()}
+    extra = [
+        message
+        for message in transcripts
+        if message.text.strip() and message.text.strip() not in seen
+    ]
+    return [*bubbles, *extra]
 
 
 def _messages_from_bubbles(paths: CursorPaths, chat: Chat) -> list[ChatMessage]:

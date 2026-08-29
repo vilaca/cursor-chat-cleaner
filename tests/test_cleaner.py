@@ -6,10 +6,17 @@ import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from cursor_cleaner.cli import build_parser, selection_archived_only
+from cursor_cleaner.cli import (
+    GC_BLOBS_HINT,
+    active_delete_warning,
+    build_parser,
+    main,
+    selection_archived_only,
+)
 from cursor_cleaner.store import (
     CursorPaths,
     _command_is_cursor_app,
@@ -214,6 +221,12 @@ class CleanerTest(unittest.TestCase):
         chats = list_chats(self.paths, older_than_days=5)
         self.assertEqual([c.composer_id for c in chats], ["arch-1"])
 
+    def test_older_than_rejects_non_positive(self) -> None:
+        with self.assertRaises(ValueError):
+            list_chats(self.paths, older_than_days=0)
+        with self.assertRaises(ValueError):
+            list_chats(self.paths, older_than_days=-5)
+
     def test_older_than_uses_created_when_updated_null(self) -> None:
         self.con.execute(
             "UPDATE composerHeaders SET lastUpdatedAt = NULL WHERE composerId = 'arch-1'"
@@ -268,6 +281,24 @@ class CleanerTest(unittest.TestCase):
     def test_list_repo_archived_only(self) -> None:
         chats = list_chats(self.paths, repo="e1f")
         self.assertEqual([c.composer_id for c in chats], ["arch-1"])
+
+    def test_same_repo_name_different_folders_stay_separate(self) -> None:
+        ws2 = self.paths.user_dir / "workspaceStorage" / "ws2"
+        ws2.mkdir(parents=True)
+        (ws2 / "workspace.json").write_text(
+            json.dumps({"folder": "file:///tmp/other/e1f"})
+        )
+        self._add_chat("arch-3", "Other e1f", archived=True, days_ago=2, workspace="ws2")
+        self.con.commit()
+        chats = list_chats(self.paths, archived_only=False, sizes=False)
+        labels = {row["repo"] for row in summarize_repos(chats)}
+        self.assertIn("work/e1f", labels)
+        self.assertIn("other/e1f", labels)
+        stats = aggregate_stats(chats)
+        self.assertIn("work/e1f", stats.repos)
+        self.assertIn("other/e1f", stats.repos)
+        self.assertEqual(stats.repos["work/e1f"]["chats"], 2)
+        self.assertEqual(stats.repos["other/e1f"]["chats"], 1)
 
     def test_list_repos(self) -> None:
         rows = summarize_repos(list_chats(self.paths, sizes=False))
@@ -569,6 +600,146 @@ class CleanerTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             load_conversation(self.paths, "nope")
 
+    def test_view_merges_transcript_text_not_in_bubbles(self) -> None:
+        self.con.execute(
+            "UPDATE cursorDiskKV SET value = ? WHERE key = 'composerData:arch-2'",
+            (json.dumps({"name": "Recent archived", "fullConversationHeadersOnly": [{"bubbleId": "u1"}]}),),
+        )
+        self.con.execute("DELETE FROM cursorDiskKV WHERE key LIKE 'bubbleId:arch-2:%'")
+        self.con.execute(
+            "INSERT INTO cursorDiskKV VALUES (?,?)",
+            (
+                "bubbleId:arch-2:u1",
+                json.dumps({"bubbleId": "u1", "type": 1, "text": "from bubbles"}),
+            ),
+        )
+        self.con.commit()
+        transcript = self.paths.projects_dir / "empty" / "agent-transcripts" / "arch-2"
+        transcript.mkdir(parents=True)
+        (transcript / "arch-2.jsonl").write_text(
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "message": {"content": [{"type": "text", "text": "from transcript"}]},
+                }
+            )
+            + "\n"
+        )
+        _chat, messages = load_conversation(self.paths, "arch-2")
+        self.assertEqual([m.text for m in messages], ["from bubbles", "from transcript"])
+
+    def test_view_includes_subagent_thread(self) -> None:
+        ts = _now_ms(1)
+        child = "sub-view"
+        self.con.execute(
+            "INSERT INTO composerHeaders VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                child,
+                "empty",
+                ts,
+                ts,
+                1,
+                1,
+                ts,
+                ts,
+                json.dumps(
+                    {
+                        "name": "Child agent",
+                        "subagentInfo": {"parentComposerId": "arch-2"},
+                    }
+                ),
+            ),
+        )
+        self.con.execute(
+            "UPDATE cursorDiskKV SET value = ? WHERE key = 'composerData:arch-2'",
+            (
+                json.dumps(
+                    {
+                        "name": "Recent archived",
+                        "subComposerIds": [child],
+                        "fullConversationHeadersOnly": [{"bubbleId": "u1"}],
+                    }
+                ),
+            ),
+        )
+        self.con.execute("DELETE FROM cursorDiskKV WHERE key LIKE 'bubbleId:arch-2:%'")
+        self.con.execute(
+            "INSERT INTO cursorDiskKV VALUES (?,?)",
+            (
+                "bubbleId:arch-2:u1",
+                json.dumps({"bubbleId": "u1", "type": 1, "text": "parent says"}),
+            ),
+        )
+        self.con.execute(
+            "INSERT INTO cursorDiskKV VALUES (?,?)",
+            (
+                f"composerData:{child}",
+                json.dumps(
+                    {
+                        "name": "Child agent",
+                        "fullConversationHeadersOnly": [{"bubbleId": "c1"}],
+                    }
+                ),
+            ),
+        )
+        self.con.execute(
+            "INSERT INTO cursorDiskKV VALUES (?,?)",
+            (
+                f"bubbleId:{child}:c1",
+                json.dumps({"bubbleId": "c1", "type": 2, "text": "child says"}),
+            ),
+        )
+        self.con.commit()
+        chat, messages = load_conversation(self.paths, "arch-2")
+        self.assertIn(child, chat.subcomposer_ids)
+        self.assertEqual(
+            [(m.role, m.text) for m in messages],
+            [("user", "parent says"), ("subagent", "Child agent"), ("assistant", "child says")],
+        )
+        self.assertIn("SUBAGENT  Child agent", format_conversation(chat, messages))
+
+    def test_workspace_json_workspace_key(self) -> None:
+        ws = self.paths.user_dir / "workspaceStorage" / "ws-multi"
+        ws.mkdir(parents=True)
+        (ws / "workspace.json").write_text(
+            json.dumps({"workspace": "file:///Users/vilaca/work/multi-root"})
+        )
+        self._add_chat("arch-ws", "Multi", archived=True, days_ago=8, workspace="ws-multi")
+        self.con.commit()
+        chats = list_chats(self.paths, ids=["arch-ws"], sizes=False)
+        self.assertEqual(chats[0].repo, "multi-root")
+
+    def _cli(self, argv: list[str]) -> tuple[int, str]:
+        out = StringIO()
+        err = StringIO()
+        args = [
+            "--user-dir",
+            str(self.paths.user_dir),
+            "--projects-dir",
+            str(self.paths.projects_dir),
+            *argv,
+        ]
+        with patch("sys.stdout", out), patch("sys.stderr", err):
+            code = main(args)
+        return code, out.getvalue() + err.getvalue()
+
+    def test_main_list_defaults_to_archived(self) -> None:
+        code, text = self._cli(["list"])
+        self.assertEqual(code, 0)
+        self.assertIn("arch-1", text)
+        self.assertNotIn("live-1", text)
+
+    def test_main_delete_repo_warns_about_active(self) -> None:
+        code, text = self._cli(["delete", "--repo", "e1f"])
+        self.assertEqual(code, 0)
+        self.assertIn("live-1", text)
+        self.assertIn("active chat(s) in this selection will be deleted", text)
+        self.assertIn("Dry run", text)
+
+    def test_main_older_than_rejects_negative(self) -> None:
+        with self.assertRaises(SystemExit):
+            self._cli(["list", "--older-than", "-1"])
+
     def test_cursor_helper_counts_as_running(self) -> None:
         self.assertTrue(
             _command_is_cursor_app(
@@ -643,6 +814,20 @@ class SelectionTest(unittest.TestCase):
 
     def test_backup_all_includes_active(self) -> None:
         self.assertFalse(selection_archived_only("backup", self._args(["backup", "--all"])))
+
+    def test_active_delete_warning(self) -> None:
+        archived = type("C", (), {"is_archived": True})()
+        active = type("C", (), {"is_archived": False})()
+        self.assertIsNone(active_delete_warning([archived, archived]))
+        self.assertEqual(
+            active_delete_warning([archived, active, active]),
+            "2 active chat(s) in this selection will be deleted, not only archived.",
+        )
+
+    def test_gc_hint_mentions_hash_keyed_leftovers(self) -> None:
+        self.assertIn("agentKv:blob", GC_BLOBS_HINT)
+        self.assertIn("composer.content", GC_BLOBS_HINT)
+        self.assertIn("inlineDiff", GC_BLOBS_HINT)
 
 
 if __name__ == "__main__":

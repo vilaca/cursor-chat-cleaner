@@ -48,6 +48,7 @@ cursor-cleaner list --sort size
 cursor-cleaner list --sort title --reverse
 cursor-cleaner list --sort repo
 cursor-cleaner list --older-than 30
+cursor-cleaner --user-dir ~/Library/Application\ Support/Cursor\ Nightly/User list
 cursor-cleaner list --repos
 cursor-cleaner list --repos --all
 cursor-cleaner list --json
@@ -80,7 +81,7 @@ cursor-cleaner backup --id <composer-id> --dest ~/Desktop/chat-backup
 cursor-cleaner backup --repo e1f --dest ~/Desktop/e1f-chats
 ```
 
-`delete` removes **archived** chats only, unless you pass `--id` or `--repo` (those include active chats in the match).
+`delete` removes **archived** chats only, unless you pass `--id` or `--repo` (those include active chats in the match). If the selection includes active chats, delete prints a warning before the dry-run or `--yes` step.
 
 ```bash
 cursor-cleaner delete --dry-run
@@ -105,7 +106,7 @@ cursor-cleaner delete --older-than 30 --yes --backup
 
 ## After a delete: Developer: GC Agent KV Blobs
 
-Deleting a chat does **not** remove leftover `agentKv:blob:<hash>` rows in `state.vscdb`. Those hold tool results, diffs, and other payloads keyed by hash, not by chat id, so they become orphans.
+Deleting a chat does **not** remove leftover hash-keyed rows in `state.vscdb`: `agentKv:blob:<hash>`, `composer.content.<hash>`, and `inlineDiff:<workspace>:<id>`. Those hold tool results, diffs, and other payloads keyed by hash, not by chat id, so they become orphans.
 
 This tool cannot safely garbage-collect them. After Cursor is quit and delete finishes:
 
@@ -113,7 +114,7 @@ This tool cannot safely garbage-collect them. After Cursor is quit and delete fi
 2. `Cmd+Shift+P`
 3. Run **Developer: GC Agent KV Blobs**
 
-That command does not remove chats from the sidebar. It only drops unreferenced blobs so `state.vscdb` can shrink.
+That command does not remove chats from the sidebar. It drops unreferenced `agentKv` blobs so `state.vscdb` can shrink. `composer.content` and `inlineDiff` rows may still remain.
 
 ## Where chats live
 
