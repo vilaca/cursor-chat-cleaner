@@ -1144,6 +1144,19 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(exited.exception.code, 0)
         self.assertEqual(stdout.getvalue(), f"cursor-chat-cleaner {__version__}\n")
 
+    def test_version_matches_pyproject(self) -> None:
+        import re
+        from pathlib import Path
+
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        match = re.search(
+            r'(?m)^version\s*=\s*"([^"]+)"',
+            pyproject.read_text(encoding="utf-8"),
+        )
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(__version__, match.group(1))
+
     def test_backup_and_delete_repo_include_active(self) -> None:
         self.assertFalse(selection_archived_only("backup", self._args(["backup", "--repo", "e1f"])))
         self.assertFalse(selection_archived_only("delete", self._args(["delete", "--repo", "e1f"])))
