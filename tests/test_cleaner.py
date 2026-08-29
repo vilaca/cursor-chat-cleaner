@@ -19,9 +19,9 @@ from cursor_chat_cleaner.cli import (
     main,
     selection_archived_only,
 )
+from cursor_chat_cleaner.schema import schema_problems
 from cursor_chat_cleaner.store import (
     CursorPaths,
-    _command_is_cursor_app,
     aggregate_stats,
     backup_chats,
     cleanup_chat_artifacts,
@@ -30,7 +30,6 @@ from cursor_chat_cleaner.store import (
     format_conversation,
     list_chats,
     load_conversation,
-    schema_problems,
     summarize_repos,
 )
 
@@ -75,7 +74,9 @@ class SchemaFixtureTest(unittest.TestCase):
                         )
                     )
 
-                self.assertEqual(schema_problems(paths), [])
+                self.assertEqual(
+                    schema_problems(paths.global_db, paths.search_db), []
+                )
 
     def test_schema_fixtures_contain_no_rows(self) -> None:
         for fixture_path in FIXTURES_DIR.glob("*/*.sql"):
@@ -492,7 +493,7 @@ class CleanerTest(unittest.TestCase):
         self.assertNotIn("gpt-5.6-sol", stats.models)
 
     def test_schema_ok(self) -> None:
-        self.assertEqual(schema_problems(self.paths), [])
+        self.assertEqual(schema_problems(self.paths.global_db, self.paths.search_db), [])
 
     def test_delete_refuses_missing_headers_table(self) -> None:
         self.con.execute("DROP TABLE composerHeaders")
@@ -712,7 +713,12 @@ class CleanerTest(unittest.TestCase):
         search.execute("DROP TABLE conversation_fts")
         search.commit()
         search.close()
-        self.assertTrue(any("conversation_fts" in item for item in schema_problems(self.paths)))
+        self.assertTrue(
+            any(
+                "conversation_fts" in item
+                for item in schema_problems(self.paths.global_db, self.paths.search_db)
+            )
+        )
         with self.assertRaises(RuntimeError):
             delete_chats(self.paths, list_chats(self.paths, ids=["arch-1"]))
         self.assertIsNotNone(
@@ -1073,29 +1079,33 @@ class CleanerTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._cli(["list", "--older-than", "-1"])
 
-    def test_cursor_helper_counts_as_running(self) -> None:
-        self.assertTrue(
-            _command_is_cursor_app(
+    @patch("cursor_chat_cleaner.store.subprocess.run")
+    def test_cursor_helper_counts_as_running(self, run) -> None:
+        cases = [
+            (
                 "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/"
-                "Contents/MacOS/Cursor Helper --type=gpu-process"
-            )
-        )
-        self.assertTrue(
-            _command_is_cursor_app("/Applications/Cursor.app/Contents/MacOS/Cursor")
-        )
-        self.assertTrue(
-            _command_is_cursor_app(
-                "/Applications/Cursor Nightly.app/Contents/MacOS/Cursor Nightly"
-            )
-        )
-        self.assertFalse(
-            _command_is_cursor_app(
+                "Contents/MacOS/Cursor Helper --type=gpu-process",
+                True,
+            ),
+            ("/Applications/Cursor.app/Contents/MacOS/Cursor", True),
+            (
+                "/Applications/Cursor Nightly.app/Contents/MacOS/Cursor Nightly",
+                True,
+            ),
+            (
                 "/System/Library/PrivateFrameworks/TextInputUIMacHelper.framework/"
                 "Versions/A/XPCServices/CursorUIViewService.xpc/Contents/MacOS/"
-                "CursorUIViewService"
-            )
-        )
-        self.assertFalse(_command_is_cursor_app("/Applications/Google Chrome.app/"))
+                "CursorUIViewService",
+                False,
+            ),
+            ("/Applications/Google Chrome.app/", False),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                run.return_value = subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=command + "\n", stderr=""
+                )
+                self.assertEqual(cursor_is_running(), expected)
 
     @patch("cursor_chat_cleaner.store.subprocess.run")
     def test_cursor_is_running_reads_ps_list(self, run) -> None:

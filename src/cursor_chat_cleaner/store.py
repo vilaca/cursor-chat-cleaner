@@ -12,10 +12,10 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from cursor_chat_cleaner.schema import (
-    assert_writable_schema as _assert_writable_schema_paths,
+    _decode,
+    assert_writable_schema,
     item_keys as _item_keys,
     kv_patterns as _kv_patterns,
-    schema_problems as _schema_problems,
     table_columns as _table_columns,
     table_exists as _table_exists,
 )
@@ -125,10 +125,6 @@ class CleanupResult:
 _CURSOR_APP_MARKERS = ("Cursor.app/", "Cursor Nightly.app/")
 
 
-def _command_is_cursor_app(command: str) -> bool:
-    return any(marker in command for marker in _CURSOR_APP_MARKERS)
-
-
 def cursor_is_running() -> bool:
     try:
         result = subprocess.run(
@@ -141,7 +137,10 @@ def cursor_is_running() -> bool:
         return True
     if result.returncode != 0:
         return True
-    return any(_command_is_cursor_app(line) for line in result.stdout.splitlines())
+    return any(
+        any(m in line for m in _CURSOR_APP_MARKERS)
+        for line in result.stdout.splitlines()
+    )
 
 
 def connect(path: Path, readonly: bool = False) -> sqlite3.Connection:
@@ -169,12 +168,6 @@ def _workspace_path(paths: CursorPaths, workspace_id: str) -> str:
     if folder.startswith("file://"):
         return unquote(folder[len("file://") :])
     return folder or workspace_id
-
-
-def _decode(value: object) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value or "")
 
 
 def _json_object(value: object) -> dict:
@@ -221,7 +214,7 @@ def _listed_subcomposer_ids(body: dict) -> list[str]:
 
 def _subagent_ids_by_parent(con: sqlite3.Connection) -> dict[str, list[str]]:
     mapping: dict[str, list[str]] = {}
-    if not _has_composer_headers(con):
+    if not _table_exists(con, "composerHeaders"):
         return mapping
     rows = con.execute(
         "SELECT composerId, value FROM composerHeaders WHERE COALESCE(isSubagent, 0) = 1"
@@ -253,18 +246,6 @@ def _ids_with_subagents(con: sqlite3.Connection, composer_ids: list[str]) -> lis
                 seen.add(child)
                 wanted.append(child)
     return wanted
-
-
-def _has_composer_headers(con: sqlite3.Connection) -> bool:
-    return _table_exists(con, "composerHeaders")
-
-
-def schema_problems(paths: CursorPaths) -> list[str]:
-    return _schema_problems(paths.global_db, paths.search_db)
-
-
-def assert_writable_schema(paths: CursorPaths) -> None:
-    _assert_writable_schema_paths(paths.global_db, paths.search_db)
 
 
 SORT_KEYS = ("updated", "created", "size", "title", "repo", "workspace")
@@ -313,7 +294,7 @@ def list_chats(
 
     con = connect(paths.global_db, readonly=True)
     try:
-        if not _has_composer_headers(con):
+        if not _table_exists(con, "composerHeaders"):
             raise RuntimeError(
                 "composerHeaders table missing; this Cursor version is not supported"
             )
@@ -743,7 +724,7 @@ def delete_chats(
     backup_dir: Path | None = None,
     require_cursor_stopped: bool = False,
 ) -> DeleteResult:
-    assert_writable_schema(paths)
+    assert_writable_schema(paths.global_db, paths.search_db)
     backup_path = None
     if backup_dir is not None:
         backup_path = backup_chats(paths, chats, backup_dir).path
@@ -885,26 +866,23 @@ def cleanup_chat_artifacts(
     )
 
 
-def format_bytes(size: int) -> str:
-    value = float(size)
-    for unit in ("B", "K", "M", "G"):
-        if value < 1024 or unit == "G":
-            if unit == "B":
-                return f"{int(value)}{unit}"
+def _format_scaled(n: int, divisor: int, units: tuple[str, ...]) -> str:
+    value = float(n)
+    for i, unit in enumerate(units):
+        if value < divisor or i == len(units) - 1:
+            if i == 0:
+                return f"{int(n)}{unit}" if unit else str(n)
             return f"{value:.1f}{unit}"
-        value /= 1024
-    return f"{size}B"
+        value /= divisor
+    return str(n)
+
+
+def format_bytes(size: int) -> str:
+    return _format_scaled(size, 1024, ("B", "K", "M", "G"))
 
 
 def format_count(n: int) -> str:
-    value = float(n)
-    for unit in ("", "K", "M", "B"):
-        if value < 1000 or unit == "B":
-            if unit == "":
-                return str(n)
-            return f"{value:.1f}{unit}"
-        value /= 1000
-    return str(n)
+    return _format_scaled(n, 1000, ("", "K", "M", "B"))
 
 
 @dataclass
@@ -1111,18 +1089,14 @@ def _messages_for_chat(paths: CursorPaths, chat: Chat) -> list[ChatMessage]:
     return _merge_message_sources(bubbles, transcripts)
 
 
-def _message_identity(message: ChatMessage) -> tuple[str, str, str]:
-    return (message.role, message.text.strip(), message.tool_name or "")
-
-
 def _merge_message_sources(
     primary: list[ChatMessage],
     supplemental: list[ChatMessage],
 ) -> list[ChatMessage]:
     matcher = SequenceMatcher(
         None,
-        [_message_identity(message) for message in primary],
-        [_message_identity(message) for message in supplemental],
+        [(m.role, m.text.strip(), m.tool_name or "") for m in primary],
+        [(m.role, m.text.strip(), m.tool_name or "") for m in supplemental],
         autojunk=False,
     )
     matches = [block for block in matcher.get_matching_blocks() if block.size]
