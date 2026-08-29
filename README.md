@@ -4,6 +4,13 @@ CLI to list, view, back up, and delete Cursor chats on macOS.
 
 Requires **macOS** and **Python 3.10+**. No extra packages.
 
+Tested with Cursor 3.17.21. Cursor's storage is an internal implementation
+detail and may change between releases; destructive commands fail closed when
+the required schema is not recognized.
+
+This is an independent community project. It is not affiliated with or
+endorsed by Anysphere.
+
 ## Create the environment
 
 From the repo root:
@@ -94,6 +101,10 @@ cursor-chat-cleaner delete --older-than 30 --yes --backup
 
 `--backup` without a path uses `~/cursor-chat-cleaner-backups/<timestamp>`. Each backup has `manifest.json`, `chats.sqlite`, optional `search.json`, and copied transcripts. Backup directories are restricted to the current user (`0700`); data files are written as `0600`.
 
+Backups are archival snapshots for inspection and retention. This project does
+not provide a restore command, and copying backup data into live Cursor storage
+is unsupported.
+
 `--vacuum` runs SQLite `VACUUM` after delete so the database file can shrink. That needs roughly as much free disk as the current DB size.
 
 If the main delete succeeds but search-index or transcript cleanup fails, the error prints the pending chat IDs. Cleanup is idempotent, so it is safe to retry:
@@ -148,3 +159,10 @@ Do not delete `state.vscdb` as a file. That can break Cursor history.
 source .venv/bin/activate
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
+
+The tests run against sanitized, schema-only snapshots from the documented
+Cursor versions. These fixtures contain no chat content or other user data.
+
+## License
+
+Licensed under the [MIT License](LICENSE).

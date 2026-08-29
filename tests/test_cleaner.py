@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
@@ -33,43 +34,53 @@ from cursor_chat_cleaner.store import (
 )
 
 
-SCHEMA = """
-CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
-CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
-CREATE TABLE composerHeaders (
-    composerId TEXT PRIMARY KEY,
-    workspaceId TEXT,
-    createdAt INTEGER,
-    lastUpdatedAt INTEGER,
-    isArchived INTEGER,
-    isSubagent INTEGER,
-    recency INTEGER,
-    checkpointAt INTEGER,
-    value TEXT
-);
-"""
-
-SEARCH_SCHEMA = """
-CREATE TABLE conversations (
-    fts_rowid INTEGER PRIMARY KEY,
-    source TEXT NOT NULL,
-    scope TEXT NOT NULL,
-    id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    branches TEXT NOT NULL,
-    updated_at INTEGER NOT NULL,
-    is_archived INTEGER NOT NULL
-);
-CREATE VIRTUAL TABLE conversation_fts USING fts5(title, body, branches);
-CREATE TABLE conversation_search_candidates (
-    id TEXT PRIMARY KEY,
-    updated_at INTEGER NOT NULL
-);
-"""
+FIXTURES_DIR = Path(__file__).with_name("fixtures")
+CURRENT_SCHEMA_FIXTURE = FIXTURES_DIR / "cursor-3.17.21"
+SCHEMA = (CURRENT_SCHEMA_FIXTURE / "state.vscdb.sql").read_text(encoding="utf-8")
+SEARCH_SCHEMA = (CURRENT_SCHEMA_FIXTURE / "conversation-search.db.sql").read_text(
+    encoding="utf-8"
+)
 
 
 def _now_ms(days_ago: int = 0) -> int:
     return int((datetime.now() - timedelta(days=days_ago)).timestamp() * 1000)
+
+
+class SchemaFixtureTest(unittest.TestCase):
+    def test_schema_fixtures_match_supported_contract(self) -> None:
+        fixture_dirs = sorted(path for path in FIXTURES_DIR.iterdir() if path.is_dir())
+        self.assertTrue(fixture_dirs)
+
+        for fixture_dir in fixture_dirs:
+            with self.subTest(fixture=fixture_dir.name), tempfile.TemporaryDirectory() as tmp:
+                user_dir = Path(tmp) / "User"
+                (user_dir / "globalStorage").mkdir(parents=True)
+                paths = CursorPaths(user_dir=user_dir, projects_dir=Path(tmp) / "projects")
+
+                with closing(sqlite3.connect(paths.global_db)) as connection:
+                    connection.executescript(
+                        (fixture_dir / "state.vscdb.sql").read_text(encoding="utf-8")
+                    )
+                    connection.execute(
+                        "INSERT INTO ItemTable VALUES (?, ?)",
+                        ("composer.composerHeaders.tableGateEnabled", "true"),
+                    )
+                    connection.commit()
+
+                with closing(sqlite3.connect(paths.search_db)) as connection:
+                    connection.executescript(
+                        (fixture_dir / "conversation-search.db.sql").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
+                self.assertEqual(schema_problems(paths), [])
+
+    def test_schema_fixtures_contain_no_rows(self) -> None:
+        for fixture_path in FIXTURES_DIR.glob("*/*.sql"):
+            with self.subTest(fixture=fixture_path):
+                sql = fixture_path.read_text(encoding="utf-8").upper()
+                self.assertNotIn("INSERT ", sql)
 
 
 class CleanerTest(unittest.TestCase):
@@ -131,7 +142,10 @@ class CleanerTest(unittest.TestCase):
         search = sqlite3.connect(self.paths.search_db)
         search.executescript(SEARCH_SCHEMA)
         search.execute(
-            "INSERT INTO conversations VALUES (1,'local','','arch-1','Old archived','[]',1,1)"
+            "INSERT INTO conversations "
+            "(fts_rowid, source, scope, id, title, branches, updated_at, "
+            "is_archived, root_fingerprint) "
+            "VALUES (1,'local','','arch-1','Old archived','[]',1,1,'fixture-root')"
         )
         search.execute("INSERT INTO conversation_fts(rowid, title, body, branches) VALUES (1,'Old archived','hello','')")
         search.execute("INSERT INTO conversation_search_candidates VALUES ('arch-1', 1)")
