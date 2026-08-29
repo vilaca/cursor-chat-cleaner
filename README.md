@@ -2,7 +2,8 @@
 
 CLI to list, view, back up, and delete Cursor chats on macOS.
 
-Requires **macOS**. The Homebrew formula installs the required Python runtime.
+Requires **macOS** and Python 3.10 or newer (Homebrew installs a Python runtime
+for you).
 
 Tested with Cursor 3.17.21. Cursor's storage is an internal implementation
 detail and may change between releases; destructive commands fail closed when
@@ -13,10 +14,16 @@ endorsed by Anysphere.
 
 ## Install
 
-Install with Homebrew:
+Homebrew:
 
 ```bash
 brew install vilaca/tap/cursor-chat-cleaner
+```
+
+Or pip:
+
+```bash
+pip install cursor-chat-cleaner
 ```
 
 Check it:

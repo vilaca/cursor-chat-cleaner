@@ -2,7 +2,13 @@
 
 ## Supported versions
 
-Until the first tagged release, security fixes are applied to the latest commit on `main`. After releases begin, this policy will be updated with the supported versions.
+| Version | Supported |
+| --- | --- |
+| 0.1.x (latest on PyPI and Homebrew) | Yes |
+| Older tagged releases | No |
+
+Security fixes land on `main` and ship in the next 0.1.x release. Only the latest
+published 0.1.x release is supported.
 
 ## Reporting a vulnerability
 
