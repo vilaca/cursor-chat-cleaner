@@ -447,6 +447,43 @@ class CleanerTest(unittest.TestCase):
             ).is_file()
         )
 
+    def test_delete_does_not_follow_traversal_id_outside_transcripts(self) -> None:
+        malicious_id = "../../../victim"
+        victim = Path(self.tmp.name) / "victim"
+        victim.mkdir()
+        marker = victim / "keep.txt"
+        marker.write_text("keep")
+        self._add_chat(
+            malicious_id,
+            "Malformed id",
+            archived=True,
+            days_ago=1,
+            workspace="ws1",
+        )
+        self.con.commit()
+
+        chats = list_chats(self.paths, ids=[malicious_id], archived_only=False)
+        delete_chats(self.paths, chats)
+
+        self.assertTrue(marker.is_file())
+
+    def test_delete_treats_glob_characters_in_id_as_literal(self) -> None:
+        transcript = self.paths.projects_dir / "Users-e1f" / "agent-transcripts" / "arch-1"
+        self.assertTrue(transcript.is_dir())
+        self._add_chat(
+            "*",
+            "Glob id",
+            archived=True,
+            days_ago=1,
+            workspace="ws1",
+        )
+        self.con.commit()
+
+        chats = list_chats(self.paths, ids=["*"], archived_only=False)
+        delete_chats(self.paths, chats)
+
+        self.assertTrue(transcript.is_dir())
+
     def test_delete_includes_subagent_linked_by_parent_id(self) -> None:
         ts = _now_ms(10)
         child = "sub-1"
@@ -525,6 +562,15 @@ class CleanerTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as raised:
             delete_chats(self.paths, [])
         self.assertIn("tableGateEnabled", str(raised.exception))
+
+    def test_delete_refuses_missing_header_gate(self) -> None:
+        self.con.execute(
+            "DELETE FROM ItemTable WHERE key = 'composer.composerHeaders.tableGateEnabled'"
+        )
+        self.con.commit()
+        with self.assertRaises(RuntimeError) as raised:
+            delete_chats(self.paths, [])
+        self.assertIn("tableGateEnabled is missing", str(raised.exception))
 
     def test_unknown_id_is_empty(self) -> None:
         self.assertEqual(list_chats(self.paths, ids=["missing"]), [])

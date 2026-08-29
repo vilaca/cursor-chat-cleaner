@@ -237,7 +237,34 @@ def _ids_with_subagents(con: sqlite3.Connection, composer_ids: list[str]) -> lis
 def _transcripts(paths: CursorPaths, composer_id: str) -> list[Path]:
     if not paths.projects_dir.is_dir():
         return []
-    return sorted(paths.projects_dir.glob(f"*/agent-transcripts/{composer_id}"))
+    if (
+        not composer_id
+        or composer_id in {".", ".."}
+        or "\x00" in composer_id
+        or Path(composer_id).name != composer_id
+    ):
+        return []
+
+    projects_root = paths.projects_dir.resolve()
+    found: list[Path] = []
+    for project_dir in paths.projects_dir.iterdir():
+        if project_dir.is_symlink():
+            continue
+        transcripts_root = project_dir / "agent-transcripts"
+        if transcripts_root.is_symlink():
+            continue
+        candidate = transcripts_root / composer_id
+        if candidate.is_symlink():
+            continue
+        try:
+            resolved_root = transcripts_root.resolve()
+            resolved_root.relative_to(projects_root)
+            candidate.resolve().relative_to(resolved_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if candidate.is_dir():
+            found.append(candidate)
+    return sorted(found)
 
 
 def _transcript_dirs_for_ids(paths: CursorPaths, composer_ids: list[str]) -> list[Path]:
@@ -306,7 +333,11 @@ def schema_problems(paths: CursorPaths) -> list[str]:
             row = con.execute(
                 "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders.tableGateEnabled'"
             ).fetchone()
-            if row is not None:
+            if row is None:
+                problems.append(
+                    "composer.composerHeaders.tableGateEnabled is missing"
+                )
+            else:
                 flag = _decode(row["value"]).strip().lower()
                 if flag not in {"true", "1"}:
                     problems.append(
