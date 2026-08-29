@@ -11,6 +11,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+from cursor_chat_cleaner import __version__
 from cursor_chat_cleaner.cli import (
     GC_BLOBS_HINT,
     active_delete_warning,
@@ -1135,6 +1136,13 @@ class CleanerTest(unittest.TestCase):
 class SelectionTest(unittest.TestCase):
     def _args(self, argv: list[str]):
         return build_parser().parse_args(argv)
+
+    def test_version(self) -> None:
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), self.assertRaises(SystemExit) as exited:
+            main(["--version"])
+        self.assertEqual(exited.exception.code, 0)
+        self.assertEqual(stdout.getvalue(), f"cursor-chat-cleaner {__version__}\n")
 
     def test_backup_and_delete_repo_include_active(self) -> None:
         self.assertFalse(selection_archived_only("backup", self._args(["backup", "--repo", "e1f"])))
