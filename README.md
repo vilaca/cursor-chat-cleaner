@@ -72,7 +72,7 @@ cursor-cleaner view <composer-id> --thinking
 cursor-cleaner view <composer-id> --json
 ```
 
-`backup` writes a copy and leaves the original in place.
+`backup` writes a copy and leaves the original in place. It copies **archived** chats only, unless you pass `--id`, `--repo`, or `--all` (`--repo` includes active chats, same as `delete --repo`).
 
 ```bash
 cursor-cleaner backup

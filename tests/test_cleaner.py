@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from cursor_cleaner.cli import build_parser, selection_archived_only
 from cursor_cleaner.store import (
     CursorPaths,
     _command_is_cursor_app,
@@ -626,6 +627,22 @@ class CleanerTest(unittest.TestCase):
         self.con.close()
         self.con = sqlite3.connect(self.paths.global_db)
         return {row[0] for row in self.con.execute("SELECT key FROM cursorDiskKV")}
+
+
+class SelectionTest(unittest.TestCase):
+    def _args(self, argv: list[str]):
+        return build_parser().parse_args(argv)
+
+    def test_backup_and_delete_repo_include_active(self) -> None:
+        self.assertFalse(selection_archived_only("backup", self._args(["backup", "--repo", "e1f"])))
+        self.assertFalse(selection_archived_only("delete", self._args(["delete", "--repo", "e1f"])))
+
+    def test_backup_without_repo_is_archived_only(self) -> None:
+        self.assertTrue(selection_archived_only("backup", self._args(["backup"])))
+        self.assertTrue(selection_archived_only("list", self._args(["list"])))
+
+    def test_backup_all_includes_active(self) -> None:
+        self.assertFalse(selection_archived_only("backup", self._args(["backup", "--all"])))
 
 
 if __name__ == "__main__":

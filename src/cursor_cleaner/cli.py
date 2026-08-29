@@ -70,7 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="List unique repos instead of chats",
     )
 
-    backup_p = sub.add_parser("backup", help="Write a copy of selected chats")
+    backup_p = sub.add_parser(
+        "backup",
+        help="Copy selected chats (archived only unless --id, --repo, or --all)",
+    )
     _add_filters(backup_p)
     backup_p.add_argument(
         "--all",
@@ -162,6 +165,16 @@ def _add_filters(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def selection_archived_only(command: str, args) -> bool:
+    if command == "stats":
+        return bool(getattr(args, "archived", False))
+    if getattr(args, "ids", None) or getattr(args, "all", False):
+        return False
+    if command in {"delete", "backup"} and getattr(args, "repo", None):
+        return False
+    return True
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -171,11 +184,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_view(args, paths)
     ids = getattr(args, "ids", None)
     repo = getattr(args, "repo", None)
-    archived_only = not ids and not getattr(args, "all", False)
-    if command == "delete" and repo:
-        archived_only = False
-    if command == "stats":
-        archived_only = bool(getattr(args, "archived", False))
+    archived_only = selection_archived_only(command, args)
 
     try:
         chats = list_chats(
