@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from cursor_cleaner.store import (
     CursorPaths,
+    _command_is_cursor_app,
     aggregate_stats,
     backup_chats,
+    cursor_is_running,
     delete_chats,
     format_conversation,
     list_chats,
     load_conversation,
+    schema_problems,
     summarize_repos,
 )
 
@@ -72,6 +77,10 @@ class CleanerTest(unittest.TestCase):
         self.paths = CursorPaths(user_dir=user, projects_dir=projects)
         self.con = sqlite3.connect(self.paths.global_db)
         self.con.executescript(SCHEMA)
+        self.con.execute(
+            "INSERT INTO ItemTable VALUES (?,?)",
+            ("composer.composerHeaders.tableGateEnabled", "true"),
+        )
         self._add_chat(
             "arch-1",
             "Old archived",
@@ -337,6 +346,26 @@ class CleanerTest(unittest.TestCase):
         self.assertEqual(stats.models["gpt-5.6-sol"] if "gpt-5.6-sol" in stats.models else 0, 0)
         self.assertNotIn("gpt-5.6-sol", stats.models)
 
+    def test_schema_ok(self) -> None:
+        self.assertEqual(schema_problems(self.paths), [])
+
+    def test_delete_refuses_missing_headers_table(self) -> None:
+        self.con.execute("DROP TABLE composerHeaders")
+        self.con.commit()
+        with self.assertRaises(RuntimeError) as raised:
+            delete_chats(self.paths, [])
+        self.assertIn("missing table composerHeaders", str(raised.exception))
+
+    def test_delete_refuses_disabled_header_gate(self) -> None:
+        self.con.execute(
+            "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerHeaders.tableGateEnabled'",
+            ("false",),
+        )
+        self.con.commit()
+        with self.assertRaises(RuntimeError) as raised:
+            delete_chats(self.paths, [])
+        self.assertIn("tableGateEnabled", str(raised.exception))
+
     def test_unknown_id_is_empty(self) -> None:
         self.assertEqual(list_chats(self.paths, ids=["missing"]), [])
 
@@ -410,6 +439,60 @@ class CleanerTest(unittest.TestCase):
     def test_view_missing(self) -> None:
         with self.assertRaises(FileNotFoundError):
             load_conversation(self.paths, "nope")
+
+    def test_cursor_helper_counts_as_running(self) -> None:
+        self.assertTrue(
+            _command_is_cursor_app(
+                "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/"
+                "Contents/MacOS/Cursor Helper --type=gpu-process"
+            )
+        )
+        self.assertTrue(
+            _command_is_cursor_app("/Applications/Cursor.app/Contents/MacOS/Cursor")
+        )
+        self.assertTrue(
+            _command_is_cursor_app(
+                "/Applications/Cursor Nightly.app/Contents/MacOS/Cursor Nightly"
+            )
+        )
+        self.assertFalse(
+            _command_is_cursor_app(
+                "/System/Library/PrivateFrameworks/TextInputUIMacHelper.framework/"
+                "Versions/A/XPCServices/CursorUIViewService.xpc/Contents/MacOS/"
+                "CursorUIViewService"
+            )
+        )
+        self.assertFalse(_command_is_cursor_app("/Applications/Google Chrome.app/"))
+
+    @patch("cursor_cleaner.store.subprocess.run")
+    def test_cursor_is_running_reads_ps_list(self, run) -> None:
+        run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "/usr/libexec/syspolicyd\n"
+                "/Applications/Cursor.app/Contents/MacOS/Cursor\n"
+            ),
+            stderr="",
+        )
+        self.assertTrue(cursor_is_running())
+
+    @patch("cursor_cleaner.store.subprocess.run")
+    def test_cursor_is_running_false_when_only_unrelated(self, run) -> None:
+        run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="/System/Library/.../CursorUIViewService\n",
+            stderr="",
+        )
+        self.assertFalse(cursor_is_running())
+
+    @patch("cursor_cleaner.store.subprocess.run")
+    def test_cursor_is_running_fail_closed_if_ps_fails(self, run) -> None:
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=3, stdout="", stderr="Cannot get process list"
+        )
+        self.assertTrue(cursor_is_running())
 
     def _kv_keys(self) -> set[str]:
         self.con.close()

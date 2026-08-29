@@ -104,17 +104,26 @@ _KV_PREFIXES = (
 )
 
 
+_CURSOR_APP_MARKERS = ("Cursor.app/", "Cursor Nightly.app/")
+
+
+def _command_is_cursor_app(command: str) -> bool:
+    return any(marker in command for marker in _CURSOR_APP_MARKERS)
+
+
 def cursor_is_running() -> bool:
     try:
         result = subprocess.run(
-            ["pgrep", "-x", "Cursor"],
+            ["ps", "-ax", "-o", "command="],
             capture_output=True,
             text=True,
             check=False,
         )
     except (FileNotFoundError, OSError):
-        return False
-    return result.returncode == 0 and bool(result.stdout.strip())
+        return True
+    if result.returncode != 0:
+        return True
+    return any(_command_is_cursor_app(line) for line in result.stdout.splitlines())
 
 
 def connect(path: Path, readonly: bool = False) -> sqlite3.Connection:
@@ -175,11 +184,72 @@ def _dir_size(path: Path) -> int:
     return total
 
 
+_REQUIRED_TABLES = {
+    "ItemTable": frozenset({"key", "value"}),
+    "cursorDiskKV": frozenset({"key", "value"}),
+    "composerHeaders": frozenset({"composerId", "isArchived", "isSubagent", "value"}),
+}
+
+
 def _has_composer_headers(con: sqlite3.Connection) -> bool:
     row = con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='composerHeaders'"
     ).fetchone()
     return row is not None
+
+
+def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})")}
+
+
+def schema_problems(paths: CursorPaths) -> list[str]:
+    if not paths.global_db.is_file():
+        return [f"Cursor database not found: {paths.global_db}"]
+    problems: list[str] = []
+    con = connect(paths.global_db, readonly=True)
+    try:
+        for table, required in _REQUIRED_TABLES.items():
+            if not _table_exists(con, table):
+                problems.append(f"missing table {table}")
+                continue
+            missing = required - _table_columns(con, table)
+            if missing:
+                problems.append(f"{table} missing columns: {', '.join(sorted(missing))}")
+        if _table_exists(con, "ItemTable"):
+            row = con.execute(
+                "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders.tableGateEnabled'"
+            ).fetchone()
+            if row is not None:
+                flag = _decode(row["value"]).strip().lower()
+                if flag not in {"true", "1"}:
+                    problems.append(
+                        "composer.composerHeaders.tableGateEnabled is not true"
+                    )
+    finally:
+        con.close()
+    if paths.search_db.is_file():
+        search = connect(paths.search_db, readonly=True)
+        try:
+            if not _table_exists(search, "conversations"):
+                problems.append("conversation-search.db missing table conversations")
+            else:
+                missing = {"id", "is_archived"} - _table_columns(search, "conversations")
+                if missing:
+                    problems.append(
+                        "conversations missing columns: " + ", ".join(sorted(missing))
+                    )
+        finally:
+            search.close()
+    return problems
+
+
+def assert_writable_schema(paths: CursorPaths) -> None:
+    problems = schema_problems(paths)
+    if problems:
+        raise RuntimeError(
+            "Refusing to change Cursor data; schema is not the expected "
+            "composerHeaders layout:\n  - " + "\n  - ".join(problems)
+        )
 
 
 SORT_KEYS = ("updated", "created", "size", "title", "repo", "workspace")
@@ -590,6 +660,7 @@ def delete_chats(
     vacuum: bool = False,
     backup_dir: Path | None = None,
 ) -> DeleteResult:
+    assert_writable_schema(paths)
     backup_path = None
     if backup_dir is not None:
         backup_path = backup_chats(paths, chats, backup_dir).path
@@ -600,10 +671,6 @@ def delete_chats(
 
     con = connect(paths.global_db)
     try:
-        if not _has_composer_headers(con):
-            raise RuntimeError(
-                "composerHeaders table missing; this Cursor version is not supported"
-            )
         con.execute("BEGIN IMMEDIATE")
         kv_rows = 0
         header_rows = 0

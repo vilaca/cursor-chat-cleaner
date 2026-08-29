@@ -101,6 +101,7 @@ cursor-cleaner delete --older-than 30 --yes --backup
 - `--yes` is required to change anything. Without it, delete is a dry-run.
 - `--force` deletes while Cursor is still running. History may come back.
 - Preview first: `list` / `view` / `delete --dry-run`.
+- `delete` refuses to write if `state.vscdb` is missing `composerHeaders` (or its `isArchived` columns) or if `composer.composerHeaders.tableGateEnabled` is not true. App version is not used as the lock.
 
 ## After a delete: Developer: GC Agent KV Blobs
 

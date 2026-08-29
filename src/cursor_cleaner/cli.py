@@ -260,7 +260,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.backup:
         backup_dir = default_backup_dir() if args.backup == "__default__" else Path(args.backup)
 
-    result = delete_chats(paths, chats, vacuum=args.vacuum, backup_dir=backup_dir)
+    try:
+        result = delete_chats(paths, chats, vacuum=args.vacuum, backup_dir=backup_dir)
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        return 2
     print(
         f"Deleted {result.chats} chat(s): "
         f"{result.header_rows} headers, {result.kv_rows} kv rows, "
