@@ -13,6 +13,7 @@ from cursor_chat_cleaner.store import (
     CursorPaths,
     aggregate_stats,
     backup_chats,
+    cleanup_chat_artifacts,
     cursor_is_running,
     default_backup_dir,
     delete_chats,
@@ -155,6 +156,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include thinking bubbles",
     )
+
+    cleanup_p = sub.add_parser(
+        "cleanup",
+        help="Retry search-index and transcript cleanup by chat id",
+    )
+    cleanup_p.add_argument(
+        "--id",
+        action="append",
+        dest="ids",
+        required=True,
+        metavar="COMPOSER_ID",
+        help="Chat id left by a partial delete (repeatable)",
+    )
+    cleanup_p.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually remove matching search rows and transcript directories",
+    )
+    cleanup_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Clean up even if Cursor is still running",
+    )
+    cleanup_p.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="VACUUM the main database after cleanup",
+    )
     return parser
 
 
@@ -228,6 +257,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     paths = paths_from_args(args)
     if command == "view":
         return _cmd_view(args, paths)
+    if command == "cleanup":
+        return _cmd_cleanup(args, paths)
     ids = getattr(args, "ids", None)
     repo = getattr(args, "repo", None)
     archived_only = selection_archived_only(command, args)
@@ -324,14 +355,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         backup_dir = default_backup_dir() if args.backup == "__default__" else Path(args.backup)
 
     try:
-        result = delete_chats(paths, chats, vacuum=args.vacuum, backup_dir=backup_dir)
+        result = delete_chats(
+            paths,
+            chats,
+            vacuum=args.vacuum,
+            backup_dir=backup_dir,
+            require_cursor_stopped=not args.force,
+        )
     except _CLI_ERRORS as exc:
         print(exc, file=sys.stderr)
         return 2
     print(
         f"Deleted {result.chats} chat(s): "
         f"{result.header_rows} headers, {result.kv_rows} kv rows, "
-        f"{result.search_rows} search rows, {result.transcript_dirs} transcripts "
+        f"{result.search_rows} search rows, "
+        f"{result.transcript_dirs} transcript directories, "
+        f"{result.transcript_files} nested transcript files "
         f"({format_bytes(result.bytes_removed)})."
     )
     if result.backup_path:
@@ -339,6 +378,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     if result.vacuumed:
         print("Database vacuumed.")
     print(GC_BLOBS_HINT)
+    return 0
+
+
+def _cmd_cleanup(args, paths: CursorPaths) -> int:
+    ids = list(dict.fromkeys(args.ids))
+    print("Cleanup IDs:")
+    for composer_id in ids:
+        print(f"  {composer_id}")
+    if not args.yes:
+        print("Dry run. Re-run with --yes to remove leftover search rows and transcripts.")
+        return 0
+    if cursor_is_running() and not args.force:
+        print(
+            "Cursor is running. Quit it fully, then re-run, or pass --force.",
+            file=sys.stderr,
+        )
+        return 3
+    try:
+        result = cleanup_chat_artifacts(
+            paths,
+            ids,
+            vacuum=args.vacuum,
+            require_cursor_stopped=not args.force,
+        )
+    except _CLI_ERRORS as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    print(
+        f"Cleanup complete: {result.search_rows} search rows, "
+        f"{result.transcript_dirs} transcript directories, "
+        f"{result.transcript_files} nested transcript files."
+    )
+    if result.vacuumed:
+        print("Database vacuumed.")
     return 0
 
 

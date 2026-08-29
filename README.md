@@ -92,15 +92,23 @@ cursor-chat-cleaner delete --repo e1f --yes --backup
 cursor-chat-cleaner delete --older-than 30 --yes --backup
 ```
 
-`--backup` without a path uses `~/cursor-chat-cleaner-backups/<timestamp>`. Each backup has `manifest.json`, `chats.sqlite`, optional `search.json`, and copied transcripts.
+`--backup` without a path uses `~/cursor-chat-cleaner-backups/<timestamp>`. Each backup has `manifest.json`, `chats.sqlite`, optional `search.json`, and copied transcripts. Backup directories are restricted to the current user (`0700`); data files are written as `0600`.
 
 `--vacuum` runs SQLite `VACUUM` after delete so the database file can shrink. That needs roughly as much free disk as the current DB size.
+
+If the main delete succeeds but search-index or transcript cleanup fails, the error prints the pending chat IDs. Cleanup is idempotent, so it is safe to retry:
+
+```bash
+cursor-chat-cleaner cleanup --id <composer-id>
+cursor-chat-cleaner cleanup --id <composer-id> --yes
+```
 
 ## Safety
 
 - **Quit Cursor** before `--yes`. An open session can rewrite history after you delete.
 - `--yes` is required to change anything. Without it, delete is a dry-run.
 - `--force` deletes while Cursor is still running. History may come back.
+- Cursor's process state is checked again immediately before the database write.
 - Preview first: `list` / `view` / `delete --dry-run`.
 - `delete` refuses to write if `state.vscdb` is missing `composerHeaders` (or its `isArchived` columns) or if `composer.composerHeaders.tableGateEnabled` is not true. App version is not used as the lock.
 

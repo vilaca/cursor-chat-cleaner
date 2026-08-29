@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -80,6 +82,7 @@ class DeleteResult:
     item_rows: int
     search_rows: int
     transcript_dirs: int
+    transcript_files: int
     bytes_removed: int
     vacuumed: bool = False
     backup_path: Path | None = None
@@ -94,6 +97,14 @@ class BackupResult:
     transcript_dirs: int
 
 
+@dataclass
+class CleanupResult:
+    search_rows: int
+    transcript_dirs: int
+    transcript_files: int
+    vacuumed: bool = False
+
+
 _KV_PREFIXES = (
     "composerData:{id}",
     "bubbleId:{id}:",
@@ -102,6 +113,8 @@ _KV_PREFIXES = (
     "codeBlockPartialInlineDiffFates:{id}:",
     "composerVirtualRowHeights:{id}",
 )
+
+_ITEM_KEYS = ("glass/cursor/{id}",)
 
 
 _CURSOR_APP_MARKERS = ("Cursor.app/", "Cursor Nightly.app/")
@@ -226,7 +239,10 @@ def _ids_with_subagents(con: sqlite3.Connection, composer_ids: list[str]) -> lis
     children = _subagent_ids_by_parent(con)
     wanted = list(dict.fromkeys(composer_ids))
     seen = set(wanted)
-    for parent in list(wanted):
+    index = 0
+    while index < len(wanted):
+        parent = wanted[index]
+        index += 1
         for child in children.get(parent, []):
             if child not in seen:
                 seen.add(child)
@@ -234,36 +250,76 @@ def _ids_with_subagents(con: sqlite3.Connection, composer_ids: list[str]) -> lis
     return wanted
 
 
-def _transcripts(paths: CursorPaths, composer_id: str) -> list[Path]:
+def _is_safe_path_segment(value: str) -> bool:
+    return bool(
+        value
+        and value not in {".", ".."}
+        and "\x00" not in value
+        and Path(value).name == value
+    )
+
+
+def _transcript_roots(paths: CursorPaths) -> list[Path]:
     if not paths.projects_dir.is_dir():
         return []
-    if (
-        not composer_id
-        or composer_id in {".", ".."}
-        or "\x00" in composer_id
-        or Path(composer_id).name != composer_id
-    ):
-        return []
-
     projects_root = paths.projects_dir.resolve()
     found: list[Path] = []
     for project_dir in paths.projects_dir.iterdir():
         if project_dir.is_symlink():
             continue
         transcripts_root = project_dir / "agent-transcripts"
-        if transcripts_root.is_symlink():
-            continue
-        candidate = transcripts_root / composer_id
-        if candidate.is_symlink():
+        if transcripts_root.is_symlink() or not transcripts_root.is_dir():
             continue
         try:
             resolved_root = transcripts_root.resolve()
             resolved_root.relative_to(projects_root)
-            candidate.resolve().relative_to(resolved_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        found.append(transcripts_root)
+    return sorted(found)
+
+
+def _transcripts(paths: CursorPaths, composer_id: str) -> list[Path]:
+    if not _is_safe_path_segment(composer_id):
+        return []
+    found: list[Path] = []
+    for transcripts_root in _transcript_roots(paths):
+        candidate = transcripts_root / composer_id
+        if candidate.is_symlink():
+            continue
+        try:
+            candidate.resolve().relative_to(transcripts_root.resolve())
         except (OSError, RuntimeError, ValueError):
             continue
         if candidate.is_dir():
             found.append(candidate)
+    return sorted(found)
+
+
+def _nested_transcript_files(paths: CursorPaths, composer_id: str) -> list[Path]:
+    if not _is_safe_path_segment(composer_id):
+        return []
+    seen: set[Path] = set()
+    found: list[Path] = []
+    for transcripts_root in _transcript_roots(paths):
+        for parent_dir in transcripts_root.iterdir():
+            if parent_dir.is_symlink() or not parent_dir.is_dir():
+                continue
+            subagents_root = parent_dir / "subagents"
+            if subagents_root.is_symlink() or not subagents_root.is_dir():
+                continue
+            candidate = subagents_root / f"{composer_id}.jsonl"
+            if candidate.is_symlink():
+                continue
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(subagents_root.resolve())
+                subagents_root.resolve().relative_to(transcripts_root.resolve())
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if candidate.is_file() and resolved not in seen:
+                seen.add(resolved)
+                found.append(candidate)
     return sorted(found)
 
 
@@ -547,9 +603,10 @@ def _chat_from_row(
     if sizes:
         size_bytes = _kv_size(con, [composer_id, *subs])
         transcripts = _transcripts(paths, composer_id)
+        all_transcripts = list(transcripts)
         for sub_id in subs:
-            transcripts.extend(_transcripts(paths, sub_id))
-        size_bytes += sum(_dir_size(path) for path in transcripts)
+            all_transcripts.extend(_transcripts(paths, sub_id))
+        size_bytes += sum(_dir_size(path) for path in all_transcripts)
     model = ""
     model_config = body.get("modelConfig")
     if isinstance(model_config, dict):
@@ -590,10 +647,11 @@ def _chat_from_row(
 def _kv_size(con: sqlite3.Connection, composer_ids: list[str]) -> int:
     total = 0
     for composer_id in composer_ids:
-        for pattern in _kv_patterns(composer_id):
-            if pattern.endswith("%"):
+        for pattern, is_prefix in _kv_patterns(composer_id):
+            if is_prefix:
                 row = con.execute(
-                    "SELECT COALESCE(SUM(length(value)), 0) FROM cursorDiskKV WHERE key LIKE ?",
+                    "SELECT COALESCE(SUM(length(value)), 0) "
+                    "FROM cursorDiskKV WHERE key LIKE ? ESCAPE '\\'",
                     (pattern,),
                 ).fetchone()
             else:
@@ -605,22 +663,40 @@ def _kv_size(con: sqlite3.Connection, composer_ids: list[str]) -> int:
     return total
 
 
-def _kv_patterns(composer_id: str) -> list[str]:
-    patterns = []
+def _kv_patterns(composer_id: str) -> list[tuple[str, bool]]:
+    patterns: list[tuple[str, bool]] = []
     for template in _KV_PREFIXES:
         key = template.format(id=composer_id)
-        patterns.append(key if not key.endswith(":") else key + "%")
+        if key.endswith(":"):
+            escaped = key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            patterns.append((escaped + "%", True))
+        else:
+            patterns.append((key, False))
     return patterns
 
 
 def _delete_kv(con: sqlite3.Connection, composer_id: str) -> int:
     deleted = 0
-    for pattern in _kv_patterns(composer_id):
-        if pattern.endswith("%"):
-            cur = con.execute("DELETE FROM cursorDiskKV WHERE key LIKE ?", (pattern,))
+    for pattern, is_prefix in _kv_patterns(composer_id):
+        if is_prefix:
+            cur = con.execute(
+                "DELETE FROM cursorDiskKV WHERE key LIKE ? ESCAPE '\\'",
+                (pattern,),
+            )
         else:
             cur = con.execute("DELETE FROM cursorDiskKV WHERE key = ?", (pattern,))
         deleted += cur.rowcount
+    return deleted
+
+
+def _item_keys(composer_id: str) -> list[str]:
+    return [template.format(id=composer_id) for template in _ITEM_KEYS]
+
+
+def _delete_items(con: sqlite3.Connection, composer_id: str) -> int:
+    deleted = 0
+    for key in _item_keys(composer_id):
+        deleted += con.execute("DELETE FROM ItemTable WHERE key = ?", (key,)).rowcount
     return deleted
 
 
@@ -700,8 +776,25 @@ def resolve_backup_dir(dest: Path | None) -> Path:
     path = dest.expanduser() if dest is not None else default_backup_dir()
     if path.exists() and any(path.iterdir()):
         path = path / datetime.now().strftime("%Y%m%d-%H%M%S")
-    path.mkdir(parents=True, exist_ok=True)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
     return path
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+        file.write(text)
+    path.chmod(0o600)
+
+
+def _make_tree_private(path: Path) -> None:
+    path.chmod(0o700)
+    for child in path.rglob("*"):
+        if child.is_symlink():
+            continue
+        child.chmod(0o700 if child.is_dir() else 0o600)
 
 
 def backup_chats(paths: CursorPaths, chats: list[Chat], dest: Path | None = None) -> BackupResult:
@@ -713,6 +806,7 @@ def backup_chats(paths: CursorPaths, chats: list[Chat], dest: Path | None = None
         src, list(dict.fromkeys(cid for chat in chats for cid in chat.ids_to_delete))
     )
     dst_path = dest_dir / "chats.sqlite"
+    dst_path.touch(mode=0o600, exist_ok=False)
     dst = sqlite3.connect(dst_path)
     try:
         for name in ("ItemTable", "cursorDiskKV", "composerHeaders"):
@@ -741,10 +835,11 @@ def backup_chats(paths: CursorPaths, chats: list[Chat], dest: Path | None = None
                 ).fetchall()
                 dst.executemany(header_sql, copied)
                 header_rows += len(copied)
-            for pattern in _kv_patterns(composer_id):
-                if pattern.endswith("%"):
+            for pattern, is_prefix in _kv_patterns(composer_id):
+                if is_prefix:
                     rows = src.execute(
-                        "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?", (pattern,)
+                        "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? ESCAPE '\\'",
+                        (pattern,),
                     ).fetchall()
                 else:
                     rows = src.execute(
@@ -752,14 +847,20 @@ def backup_chats(paths: CursorPaths, chats: list[Chat], dest: Path | None = None
                     ).fetchall()
                 dst.executemany("INSERT OR REPLACE INTO cursorDiskKV(key, value) VALUES (?, ?)", rows)
                 kv_rows += len(rows)
-            items = src.execute(
-                "SELECT key, value FROM ItemTable WHERE key LIKE ?", (f"%{composer_id}%",)
-            ).fetchall()
-            dst.executemany("INSERT OR REPLACE INTO ItemTable(key, value) VALUES (?, ?)", items)
+            for key in _item_keys(composer_id):
+                items = src.execute(
+                    "SELECT key, value FROM ItemTable WHERE key = ?",
+                    (key,),
+                ).fetchall()
+                dst.executemany(
+                    "INSERT OR REPLACE INTO ItemTable(key, value) VALUES (?, ?)",
+                    items,
+                )
         dst.commit()
     finally:
         dst.close()
         src.close()
+    dst_path.chmod(0o600)
 
     search_rows = []
     if paths.search_db.is_file():
@@ -775,13 +876,17 @@ def backup_chats(paths: CursorPaths, chats: list[Chat], dest: Path | None = None
         finally:
             search.close()
         if search_rows:
-            (dest_dir / "search.json").write_text(json.dumps(search_rows, indent=2))
+            _write_private_text(
+                dest_dir / "search.json",
+                json.dumps(search_rows, indent=2),
+            )
 
     transcript_dirs = 0
     transcripts_root = dest_dir / "transcripts"
     for path in _transcript_dirs_for_ids(paths, unique_ids):
         copy_dest = _backup_transcript_dest(paths.projects_dir, transcripts_root, path)
         shutil.copytree(path, copy_dest)
+        _make_tree_private(copy_dest)
         transcript_dirs += 1
 
     manifest = {
@@ -799,7 +904,7 @@ def backup_chats(paths: CursorPaths, chats: list[Chat], dest: Path | None = None
             for chat in chats
         ],
     }
-    (dest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    _write_private_text(dest_dir / "manifest.json", json.dumps(manifest, indent=2))
     return BackupResult(
         path=dest_dir,
         chats=len(chats),
@@ -815,6 +920,7 @@ def delete_chats(
     *,
     vacuum: bool = False,
     backup_dir: Path | None = None,
+    require_cursor_stopped: bool = False,
 ) -> DeleteResult:
     assert_writable_schema(paths)
     backup_path = None
@@ -822,13 +928,17 @@ def delete_chats(
         backup_path = backup_chats(paths, chats, backup_dir).path
 
     bytes_removed = sum(chat.size_bytes for chat in chats)
-    errors: list[BaseException] = []
 
     con = connect(paths.global_db)
     try:
         unique_ids = _ids_with_subagents(
             con, list(dict.fromkeys(cid for chat in chats for cid in chat.ids_to_delete))
         )
+        if require_cursor_stopped and cursor_is_running():
+            raise RuntimeError(
+                "Cursor started while the delete was being prepared. "
+                "Quit it fully and retry, or pass --force."
+            )
         con.execute("BEGIN IMMEDIATE")
         kv_rows = 0
         header_rows = 0
@@ -839,18 +949,82 @@ def delete_chats(
                 "DELETE FROM composerHeaders WHERE composerId = ?", (composer_id,)
             )
             header_rows += cur.rowcount
-            cur = con.execute("DELETE FROM ItemTable WHERE key LIKE ?", (f"%{composer_id}%",))
-            item_rows += cur.rowcount
+            item_rows += _delete_items(con, composer_id)
         _update_header_cache(con, set(unique_ids))
         con.commit()
     finally:
         con.close()
 
+    try:
+        cleanup = cleanup_chat_artifacts(
+            paths,
+            unique_ids,
+            vacuum=vacuum,
+            require_cursor_stopped=require_cursor_stopped,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Deleted chat headers but cleanup did not finish:\n  - "
+            + str(exc)
+            + "\nPending cleanup IDs: "
+            + json.dumps(unique_ids)
+            + "\nRun `cursor-chat-cleaner cleanup --id ID --yes` for each pending ID."
+        ) from exc
+
+    return DeleteResult(
+        chats=len(chats),
+        composer_ids=unique_ids,
+        kv_rows=kv_rows,
+        header_rows=header_rows,
+        item_rows=item_rows,
+        search_rows=cleanup.search_rows,
+        transcript_dirs=cleanup.transcript_dirs,
+        transcript_files=cleanup.transcript_files,
+        bytes_removed=bytes_removed,
+        vacuumed=cleanup.vacuumed,
+        backup_path=backup_path,
+    )
+
+
+def cleanup_chat_artifacts(
+    paths: CursorPaths,
+    composer_ids: list[str],
+    *,
+    vacuum: bool = False,
+    require_cursor_stopped: bool = False,
+) -> CleanupResult:
+    unique_ids = list(dict.fromkeys(composer_ids))
+    if not unique_ids:
+        raise ValueError("At least one composer ID is required")
+    if require_cursor_stopped and cursor_is_running():
+        raise RuntimeError(
+            "Cursor is running. Quit it fully and retry, or pass --force."
+        )
+
+    errors: list[BaseException] = []
     search_rows = 0
     try:
         search_rows = _delete_search_rows(paths, unique_ids)
     except sqlite3.Error as exc:
         errors.append(exc)
+
+    transcript_files = 0
+    seen_files: set[Path] = set()
+    for composer_id in unique_ids:
+        for path in _nested_transcript_files(paths, composer_id):
+            try:
+                resolved = path.resolve()
+            except (OSError, RuntimeError) as exc:
+                errors.append(exc)
+                continue
+            if resolved in seen_files:
+                continue
+            seen_files.add(resolved)
+            try:
+                path.unlink()
+                transcript_files += 1
+            except OSError as exc:
+                errors.append(exc)
 
     transcript_dirs = 0
     for path in _transcript_dirs_for_ids(paths, unique_ids):
@@ -862,32 +1036,31 @@ def delete_chats(
 
     vacuumed = False
     if vacuum:
-        vac = connect(paths.global_db)
-        try:
-            vac.execute("VACUUM")
-            vacuumed = True
-        except sqlite3.Error as exc:
-            errors.append(exc)
-        finally:
-            vac.close()
+        if not paths.global_db.is_file():
+            errors.append(FileNotFoundError(f"Cursor database not found: {paths.global_db}"))
+        else:
+            vac = connect(paths.global_db)
+            try:
+                vac.execute("VACUUM")
+                vacuumed = True
+            except sqlite3.Error as exc:
+                errors.append(exc)
+            finally:
+                vac.close()
 
     if errors:
         raise RuntimeError(
-            "Deleted chat headers but cleanup did not finish:\n  - "
+            "Cleanup did not finish for "
+            + json.dumps(unique_ids)
+            + ":\n  - "
             + "\n  - ".join(str(exc) for exc in errors)
         ) from errors[0]
 
-    return DeleteResult(
-        chats=len(chats),
-        composer_ids=unique_ids,
-        kv_rows=kv_rows,
-        header_rows=header_rows,
-        item_rows=item_rows,
+    return CleanupResult(
         search_rows=search_rows,
         transcript_dirs=transcript_dirs,
-        bytes_removed=bytes_removed,
+        transcript_files=transcript_files,
         vacuumed=vacuumed,
-        backup_path=backup_path,
     )
 
 
@@ -1109,18 +1282,44 @@ def format_conversation(
 
 def _messages_for_chat(paths: CursorPaths, chat: Chat) -> list[ChatMessage]:
     bubbles = _messages_from_bubbles(paths, chat)
-    transcripts = _messages_from_transcripts(chat)
+    transcripts = _messages_from_transcripts(paths, chat)
     if not bubbles:
         return transcripts
     if not transcripts:
         return bubbles
-    seen = {message.text.strip() for message in bubbles if message.text.strip()}
-    extra = [
-        message
-        for message in transcripts
-        if message.text.strip() and message.text.strip() not in seen
-    ]
-    return [*bubbles, *extra]
+    return _merge_message_sources(bubbles, transcripts)
+
+
+def _message_identity(message: ChatMessage) -> tuple[str, str, str]:
+    return (message.role, message.text.strip(), message.tool_name or "")
+
+
+def _merge_message_sources(
+    primary: list[ChatMessage],
+    supplemental: list[ChatMessage],
+) -> list[ChatMessage]:
+    matcher = SequenceMatcher(
+        None,
+        [_message_identity(message) for message in primary],
+        [_message_identity(message) for message in supplemental],
+        autojunk=False,
+    )
+    matches = [block for block in matcher.get_matching_blocks() if block.size]
+    if not matches:
+        return primary
+
+    merged: list[ChatMessage] = []
+    primary_pos = 0
+    supplemental_pos = 0
+    for block in matches:
+        merged.extend(primary[primary_pos : block.a])
+        merged.extend(supplemental[supplemental_pos : block.b])
+        merged.extend(primary[block.a : block.a + block.size])
+        primary_pos = block.a + block.size
+        supplemental_pos = block.b + block.size
+    merged.extend(primary[primary_pos:])
+    merged.extend(supplemental[supplemental_pos:])
+    return merged
 
 
 def _messages_from_bubbles(paths: CursorPaths, chat: Chat) -> list[ChatMessage]:
@@ -1215,7 +1414,10 @@ def _visible_text(text: str) -> str:
     return text
 
 
-def _messages_from_transcripts(chat: Chat) -> list[ChatMessage]:
+def _messages_from_transcripts(
+    paths: CursorPaths,
+    chat: Chat,
+) -> list[ChatMessage]:
     messages: list[ChatMessage] = []
     files: list[Path] = []
     for directory in chat.transcript_paths:
@@ -1224,7 +1426,18 @@ def _messages_from_transcripts(chat: Chat) -> list[ChatMessage]:
             for path in sorted(directory.glob("*.jsonl"))
             if path.is_file()
         )
+    files.extend(_nested_transcript_files(paths, chat.composer_id))
+    unique_files: list[Path] = []
+    seen: set[Path] = set()
     for path in files:
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_files.append(path)
+    for path in unique_files:
         try:
             lines = path.read_text(errors="replace").splitlines()
         except OSError:

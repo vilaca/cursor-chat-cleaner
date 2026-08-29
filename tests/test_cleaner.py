@@ -22,6 +22,7 @@ from cursor_chat_cleaner.store import (
     _command_is_cursor_app,
     aggregate_stats,
     backup_chats,
+    cleanup_chat_artifacts,
     cursor_is_running,
     delete_chats,
     format_conversation,
@@ -315,6 +316,11 @@ class CleanerTest(unittest.TestCase):
         self.assertEqual({c.composer_id for c in chats}, {"arch-1", "live-1"})
 
     def test_delete_archived_leaves_active(self) -> None:
+        self.con.execute(
+            "INSERT INTO ItemTable VALUES (?,?)",
+            ("unrelated/arch-1/setting", "keep"),
+        )
+        self.con.commit()
         chats = list_chats(self.paths)
         delete_chats(self.paths, chats)
         remaining = list_chats(self.paths, archived_only=False)
@@ -322,6 +328,11 @@ class CleanerTest(unittest.TestCase):
         kv = self._kv_keys()
         self.assertIn("composerData:live-1", kv)
         self.assertNotIn("composerData:arch-1", kv)
+        item_keys = {
+            row[0] for row in self.con.execute("SELECT key FROM ItemTable")
+        }
+        self.assertNotIn("glass/cursor/arch-1", item_keys)
+        self.assertIn("unrelated/arch-1/setting", item_keys)
         cache = json.loads(
             self.con.execute(
                 "SELECT value FROM ItemTable WHERE key='composer.composerHeaders'"
@@ -368,9 +379,9 @@ class CleanerTest(unittest.TestCase):
             ).is_file()
         )
         self.assertIsNone(
-            sqlite3.connect(self.paths.global_db)
-            .execute("SELECT 1 FROM composerHeaders WHERE composerId='arch-1'")
-            .fetchone()
+            self.con.execute(
+                "SELECT 1 FROM composerHeaders WHERE composerId='arch-1'"
+            ).fetchone()
         )
 
     def test_backup_command_keeps_source(self) -> None:
@@ -379,10 +390,46 @@ class CleanerTest(unittest.TestCase):
         result = backup_chats(self.paths, chats, dest)
         self.assertTrue((result.path / "chats.sqlite").is_file())
         self.assertTrue(
-            sqlite3.connect(self.paths.global_db)
-            .execute("SELECT 1 FROM composerHeaders WHERE composerId='live-1'")
-            .fetchone()
+            self.con.execute(
+                "SELECT 1 FROM composerHeaders WHERE composerId='live-1'"
+            ).fetchone()
         )
+
+    def test_backup_uses_private_permissions(self) -> None:
+        result = backup_chats(
+            self.paths,
+            list_chats(self.paths, ids=["arch-1"]),
+            Path(self.tmp.name) / "private-backup",
+        )
+        transcript = (
+            result.path
+            / "transcripts"
+            / "Users-e1f"
+            / "agent-transcripts"
+            / "arch-1"
+            / "arch-1.jsonl"
+        )
+        self.assertEqual(result.path.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((result.path / "chats.sqlite").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((result.path / "manifest.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(transcript.stat().st_mode & 0o777, 0o600)
+
+    def test_backup_copies_only_known_item_keys(self) -> None:
+        self.con.execute(
+            "INSERT INTO ItemTable VALUES (?,?)",
+            ("unrelated/arch-1/setting", "keep"),
+        )
+        self.con.commit()
+        result = backup_chats(
+            self.paths,
+            list_chats(self.paths, ids=["arch-1"]),
+            Path(self.tmp.name) / "item-backup",
+        )
+        backup = sqlite3.connect(result.path / "chats.sqlite")
+        keys = {row[0] for row in backup.execute("SELECT key FROM ItemTable")}
+        backup.close()
+        self.assertIn("glass/cursor/arch-1", keys)
+        self.assertNotIn("unrelated/arch-1/setting", keys)
 
     def test_stats(self) -> None:
         stats = aggregate_stats(list_chats(self.paths, archived_only=False, sizes=False))
@@ -484,6 +531,26 @@ class CleanerTest(unittest.TestCase):
 
         self.assertTrue(transcript.is_dir())
 
+    def test_delete_treats_sql_wildcards_in_id_as_literal(self) -> None:
+        self._add_chat(
+            "%",
+            "SQL wildcard id",
+            archived=True,
+            days_ago=1,
+            workspace="ws1",
+        )
+        self.con.commit()
+
+        delete_chats(
+            self.paths,
+            list_chats(self.paths, ids=["%"], archived_only=False),
+        )
+
+        keys = self._kv_keys()
+        self.assertIn("composerData:arch-1", keys)
+        self.assertIn("composerData:live-1", keys)
+        self.assertIn("bubbleId:arch-1:bubble-1", keys)
+
     def test_delete_includes_subagent_linked_by_parent_id(self) -> None:
         ts = _now_ms(10)
         child = "sub-1"
@@ -518,26 +585,92 @@ class CleanerTest(unittest.TestCase):
         self.assertEqual(chats[0].subcomposer_ids, [child])
         delete_chats(self.paths, chats)
         self.assertIsNone(
-            sqlite3.connect(self.paths.global_db)
-            .execute("SELECT 1 FROM composerHeaders WHERE composerId=?", (child,))
-            .fetchone()
+            self.con.execute(
+                "SELECT 1 FROM composerHeaders WHERE composerId=?", (child,)
+            ).fetchone()
         )
         self.assertNotIn(f"composerData:{child}", self._kv_keys())
 
-    @patch("cursor_chat_cleaner.store._delete_search_rows", side_effect=sqlite3.Error("fts boom"))
-    def test_delete_removes_transcripts_if_search_fails(self, _mock) -> None:
+    def test_delete_includes_deeply_nested_subagents(self) -> None:
+        ts = _now_ms(10)
+        parent = "arch-1"
+        descendants = ["sub-level-1", "sub-level-2", "sub-level-3"]
+        for child in descendants:
+            body = {
+                "name": child,
+                "subComposerIds": [],
+                "subagentInfo": {"parentComposerId": parent},
+            }
+            self.con.execute(
+                "INSERT INTO composerHeaders VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    child,
+                    "ws1",
+                    ts,
+                    ts,
+                    1,
+                    1,
+                    ts,
+                    ts,
+                    json.dumps(body),
+                ),
+            )
+            self.con.execute(
+                "INSERT INTO cursorDiskKV VALUES (?,?)",
+                (f"composerData:{child}", json.dumps(body)),
+            )
+            parent = child
+        self.con.commit()
+
+        delete_chats(self.paths, list_chats(self.paths, ids=["arch-1"]))
+
+        remaining = {
+            row[0] for row in self.con.execute("SELECT composerId FROM composerHeaders")
+        }
+        self.assertTrue(set(descendants).isdisjoint(remaining))
+
+    def test_delete_rechecks_cursor_after_backup(self) -> None:
+        chats = list_chats(self.paths, ids=["arch-1"])
+        backup = Path(self.tmp.name) / "before-recheck"
+        with patch("cursor_chat_cleaner.store.cursor_is_running", return_value=True):
+            with self.assertRaises(RuntimeError) as raised:
+                delete_chats(
+                    self.paths,
+                    chats,
+                    backup_dir=backup,
+                    require_cursor_stopped=True,
+                )
+        self.assertIn("started while the delete was being prepared", str(raised.exception))
+        self.assertTrue((backup / "manifest.json").is_file())
+        self.assertIsNotNone(
+            self.con.execute(
+                "SELECT 1 FROM composerHeaders WHERE composerId='arch-1'"
+            ).fetchone()
+        )
+
+    def test_partial_delete_cleanup_can_be_retried_idempotently(self) -> None:
         chats = list_chats(self.paths, ids=["arch-1"])
         transcript = self.paths.projects_dir / "Users-e1f" / "agent-transcripts" / "arch-1"
         self.assertTrue(transcript.is_dir())
-        with self.assertRaises(RuntimeError) as raised:
-            delete_chats(self.paths, chats)
+        with patch(
+            "cursor_chat_cleaner.store._delete_search_rows",
+            side_effect=sqlite3.Error("fts boom"),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                delete_chats(self.paths, chats)
         self.assertIn("cleanup did not finish", str(raised.exception))
+        self.assertIn("cleanup --id ID --yes", str(raised.exception))
         self.assertFalse(transcript.is_dir())
         self.assertIsNone(
-            sqlite3.connect(self.paths.global_db)
-            .execute("SELECT 1 FROM composerHeaders WHERE composerId='arch-1'")
-            .fetchone()
+            self.con.execute(
+                "SELECT 1 FROM composerHeaders WHERE composerId='arch-1'"
+            ).fetchone()
         )
+        first = cleanup_chat_artifacts(self.paths, ["arch-1"])
+        second = cleanup_chat_artifacts(self.paths, ["arch-1"])
+        self.assertEqual(first.search_rows, 1)
+        self.assertEqual(second.search_rows, 0)
+        self.assertEqual(second.transcript_dirs, 0)
 
     def test_delete_refuses_missing_search_fts(self) -> None:
         search = sqlite3.connect(self.paths.search_db)
@@ -548,9 +681,9 @@ class CleanerTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             delete_chats(self.paths, list_chats(self.paths, ids=["arch-1"]))
         self.assertIsNotNone(
-            sqlite3.connect(self.paths.global_db)
-            .execute("SELECT 1 FROM composerHeaders WHERE composerId='arch-1'")
-            .fetchone()
+            self.con.execute(
+                "SELECT 1 FROM composerHeaders WHERE composerId='arch-1'"
+            ).fetchone()
         )
 
     def test_delete_refuses_disabled_header_gate(self) -> None:
@@ -646,33 +779,78 @@ class CleanerTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             load_conversation(self.paths, "nope")
 
-    def test_view_merges_transcript_text_not_in_bubbles(self) -> None:
+    def test_view_merges_transcript_messages_around_shared_order(self) -> None:
         self.con.execute(
             "UPDATE cursorDiskKV SET value = ? WHERE key = 'composerData:arch-2'",
-            (json.dumps({"name": "Recent archived", "fullConversationHeadersOnly": [{"bubbleId": "u1"}]}),),
+            (
+                json.dumps(
+                    {
+                        "name": "Recent archived",
+                        "fullConversationHeadersOnly": [
+                            {"bubbleId": "shared"},
+                            {"bubbleId": "after"},
+                        ],
+                    }
+                ),
+            ),
+        )
+        self.con.execute("DELETE FROM cursorDiskKV WHERE key LIKE 'bubbleId:arch-2:%'")
+        self.con.executemany(
+            "INSERT INTO cursorDiskKV VALUES (?,?)",
+            [
+                (
+                    "bubbleId:arch-2:shared",
+                    json.dumps({"bubbleId": "shared", "type": 1, "text": "shared"}),
+                ),
+                (
+                    "bubbleId:arch-2:after",
+                    json.dumps({"bubbleId": "after", "type": 2, "text": "after"}),
+                ),
+            ],
+        )
+        self.con.commit()
+        transcript = self.paths.projects_dir / "empty" / "agent-transcripts" / "arch-2"
+        transcript.mkdir(parents=True)
+        (transcript / "arch-2.jsonl").write_text(
+            json.dumps({"role": "user", "message": {"content": "before"}})
+            + "\n"
+            + json.dumps({"role": "user", "message": {"content": "shared"}})
+            + "\n"
+        )
+        _chat, messages = load_conversation(self.paths, "arch-2")
+        self.assertEqual([m.text for m in messages], ["before", "shared", "after"])
+
+    def test_view_does_not_guess_order_without_shared_messages(self) -> None:
+        self.con.execute(
+            "UPDATE cursorDiskKV SET value = ? WHERE key = 'composerData:arch-2'",
+            (
+                json.dumps(
+                    {
+                        "name": "Recent archived",
+                        "fullConversationHeadersOnly": [{"bubbleId": "after"}],
+                    }
+                ),
+            ),
         )
         self.con.execute("DELETE FROM cursorDiskKV WHERE key LIKE 'bubbleId:arch-2:%'")
         self.con.execute(
             "INSERT INTO cursorDiskKV VALUES (?,?)",
             (
-                "bubbleId:arch-2:u1",
-                json.dumps({"bubbleId": "u1", "type": 1, "text": "from bubbles"}),
+                "bubbleId:arch-2:after",
+                json.dumps({"bubbleId": "after", "type": 2, "text": "after"}),
             ),
         )
         self.con.commit()
         transcript = self.paths.projects_dir / "empty" / "agent-transcripts" / "arch-2"
         transcript.mkdir(parents=True)
         (transcript / "arch-2.jsonl").write_text(
-            json.dumps(
-                {
-                    "role": "assistant",
-                    "message": {"content": [{"type": "text", "text": "from transcript"}]},
-                }
-            )
+            json.dumps({"role": "user", "message": {"content": "before"}})
             + "\n"
         )
+
         _chat, messages = load_conversation(self.paths, "arch-2")
-        self.assertEqual([m.text for m in messages], ["from bubbles", "from transcript"])
+
+        self.assertEqual([message.text for message in messages], ["after"])
 
     def test_view_includes_subagent_thread(self) -> None:
         ts = _now_ms(1)
@@ -744,6 +922,62 @@ class CleanerTest(unittest.TestCase):
         )
         self.assertIn("SUBAGENT  Child agent", format_conversation(chat, messages))
 
+    def test_view_loads_nested_subagent_transcript_without_bubbles(self) -> None:
+        ts = _now_ms(1)
+        child = "sub-transcript"
+        child_header = {
+            "name": "Transcript child",
+            "subagentInfo": {"parentComposerId": "arch-2"},
+        }
+        self.con.execute(
+            "INSERT INTO composerHeaders VALUES (?,?,?,?,?,?,?,?,?)",
+            (child, "empty", ts, ts, 1, 1, ts, ts, json.dumps(child_header)),
+        )
+        self.con.execute(
+            "UPDATE cursorDiskKV SET value = ? WHERE key = 'composerData:arch-2'",
+            (
+                json.dumps(
+                    {
+                        "name": "Recent archived",
+                        "subComposerIds": [child],
+                    }
+                ),
+            ),
+        )
+        self.con.execute(
+            "INSERT INTO cursorDiskKV VALUES (?,?)",
+            (f"composerData:{child}", json.dumps({"name": "Transcript child"})),
+        )
+        self.con.commit()
+        parent_transcript = (
+            self.paths.projects_dir / "empty" / "agent-transcripts" / "arch-2"
+        )
+        (parent_transcript / "subagents").mkdir(parents=True)
+        (parent_transcript / "arch-2.jsonl").write_text(
+            json.dumps({"role": "user", "message": {"content": "parent says"}})
+            + "\n"
+        )
+        child_transcript = parent_transcript / "subagents" / f"{child}.jsonl"
+        child_transcript.write_text(
+            json.dumps({"role": "assistant", "message": {"content": "child says"}})
+            + "\n"
+        )
+
+        _chat, messages = load_conversation(self.paths, "arch-2")
+
+        self.assertEqual(
+            [(message.role, message.text) for message in messages],
+            [
+                ("user", "parent says"),
+                ("subagent", "Transcript child"),
+                ("assistant", "child says"),
+            ],
+        )
+        cleanup = cleanup_chat_artifacts(self.paths, [child])
+        self.assertEqual(cleanup.transcript_files, 1)
+        self.assertFalse(child_transcript.exists())
+        self.assertTrue(parent_transcript.is_dir())
+
     def test_workspace_json_workspace_key(self) -> None:
         ws = self.paths.user_dir / "workspaceStorage" / "ws-multi"
         ws.mkdir(parents=True)
@@ -781,6 +1015,24 @@ class CleanerTest(unittest.TestCase):
         self.assertIn("live-1", text)
         self.assertIn("active chat(s) in this selection will be deleted", text)
         self.assertIn("Dry run", text)
+
+    def test_main_cleanup_is_dry_run_without_yes(self) -> None:
+        transcript = self.paths.projects_dir / "Users-e1f" / "agent-transcripts" / "arch-1"
+        code, text = self._cli(["cleanup", "--id", "arch-1"])
+        self.assertEqual(code, 0)
+        self.assertIn("Dry run", text)
+        self.assertTrue(transcript.is_dir())
+
+    def test_main_cleanup_removes_leftovers(self) -> None:
+        transcript = self.paths.projects_dir / "Users-e1f" / "agent-transcripts" / "arch-1"
+        with (
+            patch("cursor_chat_cleaner.cli.cursor_is_running", return_value=False),
+            patch("cursor_chat_cleaner.store.cursor_is_running", return_value=False),
+        ):
+            code, text = self._cli(["cleanup", "--id", "arch-1", "--yes"])
+        self.assertEqual(code, 0)
+        self.assertIn("1 search rows", text)
+        self.assertFalse(transcript.is_dir())
 
     def test_main_older_than_rejects_negative(self) -> None:
         with self.assertRaises(SystemExit):
