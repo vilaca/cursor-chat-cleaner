@@ -122,7 +122,10 @@ class CleanupResult:
     vacuumed: bool = False
 
 
-_CURSOR_APP_MARKERS = ("Cursor.app/", "Cursor Nightly.app/")
+_CURSOR_APP_MARKERS = (
+    "Cursor.app/Contents/MacOS/",
+    "Cursor Nightly.app/Contents/MacOS/",
+)
 
 
 def cursor_is_running() -> bool:

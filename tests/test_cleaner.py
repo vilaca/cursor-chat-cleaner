@@ -1080,17 +1080,30 @@ class CleanerTest(unittest.TestCase):
             self._cli(["list", "--older-than", "-1"])
 
     @patch("cursor_chat_cleaner.store.subprocess.run")
-    def test_cursor_helper_counts_as_running(self, run) -> None:
+    def test_only_main_editor_counts_as_running(self, run) -> None:
         cases = [
-            (
-                "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/"
-                "Contents/MacOS/Cursor Helper --type=gpu-process",
-                True,
-            ),
             ("/Applications/Cursor.app/Contents/MacOS/Cursor", True),
             (
                 "/Applications/Cursor Nightly.app/Contents/MacOS/Cursor Nightly",
                 True,
+            ),
+            # Renderer/GPU helpers live under Contents/Frameworks and can linger
+            # orphaned after the editor quits, so they must not count as running.
+            (
+                "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/"
+                "Contents/MacOS/Cursor Helper --type=gpu-process",
+                False,
+            ),
+            # Crashpad handler and sandbox proxy leftovers also outlive the editor.
+            (
+                "/Applications/Cursor.app/Contents/Frameworks/Electron Framework."
+                "framework/Helpers/chrome_crashpad_handler --no-rate-limit",
+                False,
+            ),
+            (
+                "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/"
+                "cursorsandbox --run-proxy",
+                False,
             ),
             (
                 "/System/Library/PrivateFrameworks/TextInputUIMacHelper.framework/"
