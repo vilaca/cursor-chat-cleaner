@@ -470,7 +470,7 @@ def _print_repos(chats, *, as_json: bool) -> None:
         repo = str(row["repo"])
         if len(repo) > 24:
             repo = repo[:23] + "…"
-        print(f"{repo:<24} {row['chats']:>5} {row['archived']:>5}")
+        print(f"{repo:<24} {row['chats']:>5} {'Y' if row['archived'] else 'N':>5}")
     print()
     print(f"{len(rows)} repo(s), {sum(int(row['chats']) for row in rows)} chat(s)")
 

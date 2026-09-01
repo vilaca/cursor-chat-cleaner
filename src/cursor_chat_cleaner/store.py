@@ -998,7 +998,7 @@ def format_stats(stats: ChatStats) -> str:
     for repo, row in stats.repos.items():
         label = repo if len(repo) <= 20 else repo[:19] + "…"
         lines.append(
-            f"{label:<20} {row['chats']:>5} {row['archived']:>5} "
+            f"{label:<20} {row['chats']:>5} {'Y' if row['archived'] else 'N':>5} "
             f"{row['lines_added']:>8} {row['lines_removed']:>8} "
             f"{row['files_changed']:>6} {format_count(row['tokens']):>8}"
         )
