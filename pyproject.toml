@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cursor-chat-cleaner"
-version = "0.1.0"
+version = "0.1.1"
 description = "Find, back up, and delete Cursor chats on macOS"
 authors = [{ name = "João Vilaça" }]
 readme = "README.md"
