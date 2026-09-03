@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-03
+
+### Fixed
+
+- Show Y/N instead of 0/1 for the ARCH column in `stats` and `repos` output.
+- Only treat the main Cursor editor process as running (not helper processes).
+
 ## [0.1.0] - 2026-08-29
 
 ### Added
