@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-03
+
+### Changed
+
+- Homebrew formula is now updated automatically on each release.
+- Release workflow is idempotent: retries skip already-published PyPI and GitHub
+  release assets.
+
 ## [0.1.1] - 2026-09-03
 
 ### Fixed
