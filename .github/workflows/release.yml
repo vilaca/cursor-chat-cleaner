@@ -85,6 +85,66 @@ jobs:
           name: python-distributions
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  update-homebrew:
+    name: Update Homebrew formula
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Fetch PyPI metadata
+        id: pypi
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+
+          version = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          with urllib.request.urlopen(f"https://pypi.org/pypi/cursor-chat-cleaner/{version}/json") as resp:
+              data = json.load(resp)
+
+          sdist = next(f for f in data["urls"] if f["packagetype"] == "sdist")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"url={sdist['url']}\n")
+              out.write(f"sha256={sdist['digests']['sha256']}\n")
+          PY
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: vilaca/homebrew-tap
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+
+      - name: Update formula
+        run: |
+          python - <<'PY'
+          import os, re
+
+          path = "Formula/cursor-chat-cleaner.rb"
+          formula = open(path).read()
+
+          # Replace only the top-level url and sha256 (before the first resource block)
+          resource_pos = formula.index("  resource ")
+          head, tail = formula[:resource_pos], formula[resource_pos:]
+
+          head = re.sub(r'url ".*?"', f'url "{os.environ["PYPI_URL"]}"', head, count=1)
+          head = re.sub(r'sha256 ".*?"', f'sha256 "{os.environ["PYPI_SHA256"]}"', head, count=1)
+
+          open(path, "w").write(head + tail)
+          PY
+        env:
+          PYPI_URL: ${{ steps.pypi.outputs.url }}
+          PYPI_SHA256: ${{ steps.pypi.outputs.sha256 }}
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/cursor-chat-cleaner.rb
+          git diff --cached --quiet || git commit -m "Update cursor-chat-cleaner to ${GITHUB_REF_NAME}"
+          git push
 
   github-release:
     name: Create GitHub release
@@ -115,7 +175,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file release-notes.md
+          if gh release view "$GITHUB_REF_NAME" &>/dev/null; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file release-notes.md
+          fi
